@@ -1,0 +1,120 @@
+{
+    "DEFAULT_2_WHEELED_VEHICLE": {
+        "vClass": "motorcycle"
+    },
+    "DEFAULT_WHEELED_VEHICLE": {
+        "vClass": "passenger"
+    },
+    "carla_blueprints": {
+        "vehicle.audi.a2": {
+            "vClass": "passenger"
+        },
+        "vehicle.audi.tt": {
+            "vClass": "passenger"
+        },
+        "vehicle.bmw.grandtourer": {
+            "vClass": "passenger"
+        },
+        "vehicle.chevrolet.impala": {
+            "vClass": "passenger"
+        },
+        "vehicle.citroen.c3": {
+            "vClass": "passenger"
+        },
+        "vehicle.jeep.wrangler_rubicon": {
+            "vClass": "passenger"
+        },
+        "vehicle.lincoln.mkz_2017": {
+            "vClass": "passenger"
+        },
+        "vehicle.mercedes.coupe": {
+            "vClass": "passenger"
+        },
+        "vehicle.mini.cooper_s": {
+            "vClass": "passenger"
+        },
+        "vehicle.ford.mustang": {
+            "vClass": "passenger"
+        },
+        "vehicle.nissan.micra": {
+            "vClass": "passenger"
+        },
+        "vehicle.nissan.patrol": {
+            "vClass": "passenger"
+        },
+        "vehicle.seat.leon": {
+            "vClass": "passenger"
+        },
+        "vehicle.volkswagen.t2": {
+            "vClass": "passenger",
+            "guiShape": "passenger/van"
+        },
+        "vehicle.dodge.charger_police": {
+            "vClass": "authority",
+            "guiShape": "police"
+        },
+        "vehicle.micro.microlino": {
+            "vClass": "evehicle"
+        },
+        "vehicle.toyota.prius": {
+            "vClass": "evehicle"
+        },
+        "vehicle.tesla.cybertruck": {
+            "vClass": "evehicle"
+        },
+        "vehicle.tesla.model3": {
+            "vClass": "evehicle"
+        },
+        "vehicle.audi.etron": {
+            "vClass": "evehicle"
+        },
+        "vehicle.lexus.utlexus": {
+            "vClass": "evehicle",
+            "emissionClass": "Energy/unknown",
+            "minGap": "2.5",
+            "maxSpeed": "29.06",
+            "color": "128,128,128",
+            "accel": "1.0",
+            "decel": "1.0",
+            "sigma": "0.03",
+            "mass": "1830.0",
+            "params": {
+                "has.battery.device": "true",
+                "device.battery.capacity": "9500.0",
+                "device.battery.chargeLevel": "1995.0",
+                "airDragCoefficient": "0.35",
+                "constantPowerIntake": "100.0",
+                "frontSurfaceArea": "2.6",
+                "rotatingMass": "40.0",
+                "maximumPower": "150000.0",
+                "propulsionEfficiency": "0.98",
+                "radialDragCoefficient": "0.1",
+                "recuperationEfficiency": "0.96",
+                "rollDragCoefficient": "0.01",
+                "stoppingThreshold": "0.4"
+            }
+        },
+        "vehicle.carlamotors.carlacola": {
+            "vClass": "truck",
+            "guiShape": "truck"
+        },
+        "vehicle.yamaha.yzf": {
+            "vClass": "motorcycle"
+        },
+        "vehicle.harley-davidson.low_rider": {
+            "vClass": "motorcycle"
+        },
+        "vehicle.kawasaki.ninja": {
+            "vClass": "motorcycle"
+        },
+        "vehicle.gazelle.omafiets": {
+            "vClass": "bicycle"
+        },
+        "vehicle.diamondback.century": {
+            "vClass": "bicycle"
+        },
+        "vehicle.bh.crossbike": {
+            "vClass": "bicycle"
+        }
+    }
+}

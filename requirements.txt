@@ -1,0 +1,11 @@
+carla==0.9.15
+flask==3.0.3
+folium==0.18.0
+lxml==6.1.0
+pydeck==0.9.1
+setuptools
+streamlit==1.40.1
+streamlit-folium==0.22.1
+streamlit_autorefresh==1.0.1
+traci==1.26.0
+

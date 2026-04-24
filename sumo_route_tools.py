@@ -1,0 +1,1742 @@
+from dataclasses import dataclass
+from importlib.metadata import PackageNotFoundError, version as package_version
+from pathlib import Path
+import json
+import math
+import os
+import random
+import shutil
+import socket
+import subprocess
+import sys
+import time
+import xml.etree.ElementTree as ET
+
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+EGO_SUMO_VTYPE = "ego_vehicle_type"
+SUPPORTED_CARLA_VERSIONS = ("0.9.13", "0.9.15")
+DEFAULT_CARLA_VERSION = "0.9.15"
+ACTIVE_CARLA_VERSION = None
+
+CARLA_DIR = None
+CARLA_SCRIPT = None
+CARLA_CONFIG_SCRIPT = None
+SUMO_DIR = None
+EXAMPLES_DIR = None
+NET_DIR = None
+ROUTE_DIR = None
+OUTPUT_DIR = None
+SUMO_TOOLS_DIR = None
+CARLA_VTYPES_JSON = None
+CARLA_VTYPE_FILE = None
+EGO_VTYPE_FILE = None
+CARLA_DIST_DIR = None
+VTYPE_FILES = ()
+
+DEFAULT_MAP = "Town04"
+DEFAULT_VEHICLE_TYPE = "vehicle.bmw.grandtourer"
+DEFAULT_EGO_BLUEPRINT = "vehicle.tesla.model3"
+AUTOWARE_EGO_VTYPE = "vehicle.lexus.utlexus"
+DEFAULT_EGO_BATTERY_CAPACITY = 10400.0
+DEFAULT_SUMO_HOME = "/usr/share/sumo"
+BUNDLED_SUMO_HOME = PROJECT_ROOT / "sumo"
+DEFAULT_CARLA_HOST = "127.0.0.1"
+DEFAULT_CARLA_PORT = 2000
+DEFAULT_AUTOWARE_DOCKER_FILTER = "autoware"
+
+XSI_NS = "http://www.w3.org/2001/XMLSchema-instance"
+
+ENERGY_EMISSION_CLASS = "Energy"
+MMPEVEM_EMISSION_CLASS = "MMPEVEM"
+
+ENERGY_ATTRIBUTE_DEFAULTS = {
+    "minGap": "2.50",
+    "maxSpeed": "29.06",
+    "color": "white",
+    "accel": "1.0",
+    "decel": "1.0",
+    "sigma": "0.0",
+    "mass": "1830",
+}
+
+ENERGY_PARAM_DEFAULTS = {
+    "airDragCoefficient": "0.35",
+    "constantPowerIntake": "100",
+    "frontSurfaceArea": "2.6",
+    "rotatingMass": "40",
+    "maximumPower": "150000",
+    "propulsionEfficiency": ".98",
+    "radialDragCoefficient": "0.1",
+    "recuperationEfficiency": ".96",
+    "rollDragCoefficient": "0.01",
+    "stoppingThreshold": "0.1",
+}
+
+MMPEVEM_ATTRIBUTE_DEFAULTS = {
+    "actionStepLength": "1.0",
+}
+
+MMPEVEM_PARAM_DEFAULTS = {
+    "vehicleMass": "2100",
+    "wheelRadius": "0.3835",
+    "internalMomentOfInertia": "16",
+    "rollDragCoefficient": "0.01",
+    "airDragCoefficient": "0.29",
+    "frontSurfaceArea": "3.23",
+    "gearRatio": "9.325",
+    "gearEfficiency": "0.96",
+    "maximumTorque": "380",
+    "maximumPower": "180000",
+    "maximumRecuperationTorque": "180",
+    "maximumRecuperationPower": "105000",
+    "internalBatteryResistance": "0.1575",
+    "nominalBatteryVoltage": "405",
+    "constantPowerIntake": "360",
+    "powerLossMap": "",
+}
+
+BASE_COLOR_VALUES = {
+    "white": "255,255,255",
+    "black": "0,0,0",
+    "gray": "128,128,128",
+    "silver": "192,192,192",
+    "red": "255,0,0",
+    "green": "0,128,0",
+    "blue": "0,0,255",
+    "yellow": "255,255,0",
+    "orange": "255,165,0",
+    "cyan": "0,255,255",
+    "magenta": "255,0,255",
+}
+BASE_COLOR_NAMES = {
+    value: key
+    for key, value in BASE_COLOR_VALUES.items()
+}
+
+
+def _normalize_carla_version(version):
+    if version is None:
+        return DEFAULT_CARLA_VERSION
+
+    normalized = str(version).strip()
+    if normalized.startswith("CARLA_"):
+        normalized = normalized.replace("CARLA_", "", 1)
+
+    return normalized
+
+
+def available_carla_versions():
+    versions = []
+    for version in SUPPORTED_CARLA_VERSIONS:
+        if (PROJECT_ROOT / f"CARLA_{version}").exists():
+            versions.append(version)
+    return versions
+
+
+def carla_paths(version=None):
+    normalized = _normalize_carla_version(version)
+    carla_dir = PROJECT_ROOT / f"CARLA_{normalized}"
+    if not carla_dir.exists():
+        raise FileNotFoundError(f"CARLA installation not found: {carla_dir}")
+
+    sumo_dir = carla_dir / "Co-Simulation" / "Sumo"
+    examples_dir = sumo_dir / "examples"
+    return {
+        "version": normalized,
+        "carla_dir": carla_dir,
+        "carla_script": carla_dir / "CarlaUE4.sh",
+        "carla_config_script": carla_dir / "PythonAPI" / "util" / "config.py",
+        "carla_dist_dir": carla_dir / "PythonAPI" / "carla" / "dist",
+        "sumo_dir": sumo_dir,
+        "examples_dir": examples_dir,
+        "net_dir": examples_dir / "net",
+        "route_dir": examples_dir / "rou",
+        "output_dir": examples_dir / "output",
+        "sumo_tools_dir": examples_dir / "tools",
+        "carla_vtypes_json": sumo_dir / "data" / "vtypes.json",
+        "carla_vtype_file": examples_dir / "carlavtypes.rou.xml",
+        "ego_vtype_file": examples_dir / "egovtype.xml",
+    }
+
+
+def set_active_carla_version(version=None):
+    global ACTIVE_CARLA_VERSION
+    global CARLA_DIR, CARLA_SCRIPT, CARLA_CONFIG_SCRIPT, CARLA_DIST_DIR
+    global SUMO_DIR, EXAMPLES_DIR, NET_DIR, ROUTE_DIR, OUTPUT_DIR, SUMO_TOOLS_DIR
+    global CARLA_VTYPES_JSON, CARLA_VTYPE_FILE, EGO_VTYPE_FILE
+    global VTYPE_FILES
+
+    paths = carla_paths(version)
+    ACTIVE_CARLA_VERSION = paths["version"]
+    CARLA_DIR = paths["carla_dir"]
+    CARLA_SCRIPT = paths["carla_script"]
+    CARLA_CONFIG_SCRIPT = paths["carla_config_script"]
+    CARLA_DIST_DIR = paths["carla_dist_dir"]
+    SUMO_DIR = paths["sumo_dir"]
+    EXAMPLES_DIR = paths["examples_dir"]
+    NET_DIR = paths["net_dir"]
+    ROUTE_DIR = paths["route_dir"]
+    OUTPUT_DIR = paths["output_dir"]
+    SUMO_TOOLS_DIR = paths["sumo_tools_dir"]
+    CARLA_VTYPES_JSON = paths["carla_vtypes_json"]
+    CARLA_VTYPE_FILE = paths["carla_vtype_file"]
+    EGO_VTYPE_FILE = paths["ego_vtype_file"]
+    VTYPE_FILES = (
+        CARLA_VTYPE_FILE,
+        EGO_VTYPE_FILE,
+    )
+    return ACTIVE_CARLA_VERSION
+
+
+def active_carla_version():
+    return ACTIVE_CARLA_VERSION
+
+
+def current_sumo_dir():
+    return SUMO_DIR
+
+
+def installed_carla_python_api_version():
+    try:
+        return package_version("carla")
+    except PackageNotFoundError:
+        return None
+
+
+def _carla_python_env_var_name(version=None):
+    normalized = _normalize_carla_version(version or active_carla_version())
+    return f"CARLA_PYTHON_{normalized.replace('.', '_')}"
+
+
+def resolve_carla_python_executable(version=None):
+    candidates = []
+
+    version_specific = os.environ.get(_carla_python_env_var_name(version))
+    if version_specific:
+        candidates.append(version_specific)
+
+    generic = os.environ.get("CARLA_PYTHON")
+    if generic:
+        candidates.append(generic)
+
+    candidates.append(sys.executable)
+
+    seen = set()
+    for candidate in candidates:
+        resolved = Path(candidate).expanduser().resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        if resolved.exists():
+            return resolved
+
+    raise FileNotFoundError(
+        "No usable Python interpreter found for CARLA. "
+        f"Set {_carla_python_env_var_name(version)} or CARLA_PYTHON."
+    )
+
+
+def selected_carla_python_api_archive():
+    if CARLA_DIST_DIR is None or not CARLA_DIST_DIR.exists():
+        return None
+
+    active_version = active_carla_version()
+    if installed_carla_python_api_version() == active_version:
+        return None
+
+    candidates = [
+        path
+        for path in sorted(CARLA_DIST_DIR.iterdir())
+        if path.suffix in {".egg", ".whl"}
+        and "py2.7" not in path.name
+        and "cp27" not in path.name
+    ]
+    if not candidates:
+        return None
+
+    py_major = sys.version_info.major
+    py_minor = sys.version_info.minor
+
+    def score(path):
+        name = path.name
+        return (
+            f"cp{py_major}{py_minor}" in name or f"py{py_major}.{py_minor}" in name,
+            "py3" in name or "cp3" in name,
+            path.suffix == ".egg",
+        )
+
+    candidates.sort(key=score, reverse=True)
+    return candidates[0]
+
+
+def selected_carla_runtime_library_dirs(python_executable=None):
+    candidates = []
+    executable = Path(python_executable or sys.executable).resolve()
+    candidates.append(executable.parent.parent / "lib")
+
+    conda_exe = os.environ.get("CONDA_EXE")
+    if conda_exe:
+        candidates.append(Path(conda_exe).resolve().parent.parent / "lib")
+
+    home_dir = Path.home()
+    for dirname in ("anaconda3", "miniconda3", "miniforge3", "mambaforge"):
+        candidates.append(home_dir / dirname / "lib")
+
+    library_dirs = []
+    seen = set()
+    for path in candidates:
+        if path in seen or not path.exists():
+            continue
+        seen.add(path)
+        runtime_markers = (
+            path / "libtiff.so.5",
+            path / "libomp.so.5",
+            path / "libomp.so",
+        )
+        if any(marker.exists() for marker in runtime_markers):
+            library_dirs.append(path)
+
+    return library_dirs
+
+
+def ensure_carla_python_api_ready():
+    python_executable = resolve_carla_python_executable()
+    command = [str(python_executable), "-c", "import carla"]
+    process = subprocess.run(
+        command,
+        env=_build_env(),
+        capture_output=True,
+        text=True,
+    )
+    if process.returncode == 0:
+        return
+
+    details = (process.stderr or process.stdout or "").strip()
+    if details:
+        details = details.splitlines()[-1]
+
+    raise RuntimeError(
+        "The selected CARLA Python API is not usable in the current environment "
+        f"(version {active_carla_version()}, interpreter {python_executable}). "
+        f"{details or 'import carla failed.'}"
+    )
+
+
+def ensure_carla_runner_dependencies_ready():
+    python_executable = resolve_carla_python_executable()
+    command = [
+        str(python_executable),
+        "-c",
+        (
+            "import carla; "
+            "import flask; "
+            "import lxml.etree; "
+            "import traci; "
+            "import sumolib"
+        ),
+    ]
+    process = subprocess.run(
+        command,
+        env=_build_env(),
+        capture_output=True,
+        text=True,
+    )
+    if process.returncode == 0:
+        return
+
+    details = (process.stderr or process.stdout or "").strip()
+    if details:
+        details = details.splitlines()[-1]
+
+    raise RuntimeError(
+        "The selected CARLA runner Python environment is missing required modules "
+        f"(version {active_carla_version()}, interpreter {python_executable}). "
+        "Install at least `setuptools`, `flask`, `lxml`, and the SUMO Python tools "
+        "(`traci`, `sumolib`) in that interpreter. "
+        f"{details or 'dependency import failed.'}"
+    )
+
+
+def _docker_exec_env():
+    env = os.environ.copy()
+    return env
+
+
+def find_running_autoware_container(name_filter=DEFAULT_AUTOWARE_DOCKER_FILTER):
+    docker_binary = shutil.which("docker")
+    if docker_binary is None:
+        raise FileNotFoundError("Docker executable not found in PATH.")
+
+    process = subprocess.run(
+        [
+            docker_binary,
+            "ps",
+            "--format",
+            "{{json .}}",
+        ],
+        env=_docker_exec_env(),
+        capture_output=True,
+        text=True,
+    )
+    if process.returncode != 0:
+        raise RuntimeError(
+            f"Could not inspect running Docker containers: {process.stderr.strip() or process.stdout.strip()}"
+        )
+
+    filter_text = (name_filter or DEFAULT_AUTOWARE_DOCKER_FILTER).strip().lower()
+    candidates = []
+    for line in process.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            container = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+
+        name = str(container.get("Names", ""))
+        image = str(container.get("Image", ""))
+        search_blob = f"{name} {image}".lower()
+        if filter_text and filter_text not in search_blob:
+            continue
+
+        score = (
+            "autoware_mini" in search_blob,
+            "autoware" in name.lower(),
+            "autoware" in image.lower(),
+        )
+        candidates.append((score, container))
+
+    if not candidates:
+        raise RuntimeError(
+            f"No running Docker container matching '{filter_text}' was found."
+        )
+
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    return candidates[0][1]
+
+
+def launch_autoware_carla_in_container(map_name, name_filter=DEFAULT_AUTOWARE_DOCKER_FILTER):
+    map_name = str(map_name).strip()
+    if not map_name:
+        raise ValueError("A valid map name is required to start Autoware.")
+
+    container = find_running_autoware_container(name_filter=name_filter)
+    container_name = container.get("Names") or container.get("ID")
+    docker_binary = shutil.which("docker")
+    command = (
+        f"roslaunch autoware_mini start_carla.launch "
+        f"map_name:={map_name} generate_traffic:=false"
+    )
+    process = subprocess.run(
+        [
+            docker_binary,
+            "exec",
+            "-d",
+            str(container_name),
+            "sh",
+            "-lc",
+            command,
+        ],
+        env=_docker_exec_env(),
+        capture_output=True,
+        text=True,
+    )
+    if process.returncode != 0:
+        raise RuntimeError(
+            f"Could not start Autoware in container '{container_name}': "
+            f"{process.stderr.strip() or process.stdout.strip()}"
+        )
+
+    return {
+        "container_name": str(container_name),
+        "container_image": str(container.get("Image", "")),
+        "command": command,
+    }
+
+
+set_active_carla_version(
+    DEFAULT_CARLA_VERSION
+    if (PROJECT_ROOT / f"CARLA_{DEFAULT_CARLA_VERSION}").exists()
+    else (available_carla_versions()[0] if available_carla_versions() else DEFAULT_CARLA_VERSION)
+)
+
+
+@dataclass(frozen=True)
+class SumoEdge:
+    edge_id: str
+    from_node: str
+    to_node: str
+    length: float
+    lane_count: int
+    shape: tuple
+
+
+@dataclass(frozen=True)
+class ScenarioResult:
+    map_name: str
+    target_edge: str
+    route_file: Path
+    trip_file: Path
+    sumocfg_file: Path
+    command: list
+    generated_count: int
+    requested_count: int
+    target_count: int
+    mode: str
+    stdout: str
+    stderr: str
+
+
+@dataclass(frozen=True)
+class SynchronizationLaunch:
+    sync_process: object
+    carla_process: object
+    sync_log_file: Path
+    carla_log_file: Path
+    carla_started: bool
+    map_loaded: bool
+    map_stdout: str
+    map_stderr: str
+
+
+def available_maps():
+    return sorted(path.stem.replace(".net", "") for path in NET_DIR.glob("*.net.xml"))
+
+
+def available_vehicle_types():
+    vehicle_types = []
+    seen = set()
+
+    for path in VTYPE_FILES:
+        if not path.exists():
+            continue
+
+        root = ET.parse(path).getroot()
+        for element in root.iter("vType"):
+            type_id = element.get("id")
+            if not type_id or type_id in seen:
+                continue
+            if type_id == EGO_SUMO_VTYPE:
+                continue
+
+            vehicle_types.append(type_id)
+            seen.add(type_id)
+
+    if DEFAULT_VEHICLE_TYPE in seen:
+        vehicle_types.remove(DEFAULT_VEHICLE_TYPE)
+        vehicle_types.insert(0, DEFAULT_VEHICLE_TYPE)
+
+    return vehicle_types
+
+
+def _read_carla_blueprints_json():
+    if not CARLA_VTYPES_JSON.exists():
+        return {}
+
+    with CARLA_VTYPES_JSON.open(encoding="utf-8") as handle:
+        return json.load(handle).get("carla_blueprints", {})
+
+
+def _read_carla_vtypes_data():
+    if not CARLA_VTYPES_JSON.exists():
+        return {
+            "DEFAULT_2_WHEELED_VEHICLE": {"vClass": "motorcycle"},
+            "DEFAULT_WHEELED_VEHICLE": {"vClass": "passenger"},
+            "carla_blueprints": {},
+        }
+
+    with CARLA_VTYPES_JSON.open(encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def _write_carla_vtypes_data(data):
+    CARLA_VTYPES_JSON.parent.mkdir(parents=True, exist_ok=True)
+    with CARLA_VTYPES_JSON.open("w", encoding="utf-8") as handle:
+        json.dump(data, handle, indent=4)
+        handle.write("\n")
+
+
+def _normalize_color_for_storage(color_value):
+    if color_value is None:
+        return None
+
+    color_text = str(color_value).strip()
+    if not color_text:
+        return None
+
+    return BASE_COLOR_VALUES.get(color_text.lower(), color_text)
+
+
+def _normalize_color_for_form(color_value):
+    if color_value is None:
+        return "white"
+
+    color_text = str(color_value).strip()
+    if not color_text:
+        return "white"
+
+    if color_text.lower() in BASE_COLOR_VALUES:
+        return color_text.lower()
+
+    normalized = color_text.replace(" ", "")
+    return BASE_COLOR_NAMES.get(normalized, "white")
+
+
+def _merge_vtype_xml_specs(specs, path):
+    if not path.exists():
+        return
+
+    root = ET.parse(path).getroot()
+    for element in root.iter("vType"):
+        type_id = element.get("id")
+        if not type_id:
+            continue
+
+        target = specs.setdefault(type_id, {})
+        for key, value in element.attrib.items():
+            if key != "id" and value is not None:
+                target[key] = value
+
+
+def carla_vehicle_type_specs():
+    specs = {
+        type_id: dict(values)
+        for type_id, values in _read_carla_blueprints_json().items()
+    }
+    _merge_vtype_xml_specs(specs, CARLA_VTYPE_FILE)
+
+    return {
+        type_id: values
+        for type_id, values in specs.items()
+        if type_id.startswith("vehicle.")
+    }
+
+
+def available_carla_vehicle_types():
+    vehicle_types = sorted(carla_vehicle_type_specs())
+
+    if DEFAULT_EGO_BLUEPRINT in vehicle_types:
+        vehicle_types.remove(DEFAULT_EGO_BLUEPRINT)
+        vehicle_types.insert(0, DEFAULT_EGO_BLUEPRINT)
+
+    return vehicle_types
+
+
+def _vtype_params(vtype):
+    return {
+        param.get("key"): param.get("value", "")
+        for param in vtype.findall("param")
+        if param.get("key")
+    }
+
+
+def _parameter_payload(params):
+    return {
+        key: str(value)
+        for key, value in (params or {}).items()
+        if value is not None and str(value).strip() != ""
+    }
+
+
+def ego_emission_class_value(emission_model):
+    if emission_model == MMPEVEM_EMISSION_CLASS:
+        return MMPEVEM_EMISSION_CLASS
+    return "Energy/unknown"
+
+
+def ego_model_defaults(emission_model):
+    if emission_model == MMPEVEM_EMISSION_CLASS:
+        return dict(MMPEVEM_ATTRIBUTE_DEFAULTS), dict(MMPEVEM_PARAM_DEFAULTS)
+    return dict(ENERGY_ATTRIBUTE_DEFAULTS), dict(ENERGY_PARAM_DEFAULTS)
+
+
+def read_ego_vtype_config():
+    config = {
+        "sumo_vtype": EGO_SUMO_VTYPE,
+        "carla_blueprint": DEFAULT_EGO_BLUEPRINT,
+        "emission_model": ENERGY_EMISSION_CLASS,
+        "battery_capacity": DEFAULT_EGO_BATTERY_CAPACITY,
+        "attributes": dict(ENERGY_ATTRIBUTE_DEFAULTS),
+        "parameters": dict(ENERGY_PARAM_DEFAULTS),
+    }
+
+    if not EGO_VTYPE_FILE.exists():
+        return config
+
+    root = ET.parse(EGO_VTYPE_FILE).getroot()
+    vtype = root.find("vType")
+    if vtype is None:
+        return config
+
+    params = _vtype_params(vtype)
+    vtype_id = vtype.get("id") or EGO_SUMO_VTYPE
+    carla_blueprint = params.get("carla.blueprint")
+    if not carla_blueprint and vtype_id.startswith("vehicle."):
+        carla_blueprint = vtype_id
+
+    emission_class = vtype.get("emissionClass", "")
+    emission_model = (
+        MMPEVEM_EMISSION_CLASS
+        if emission_class == MMPEVEM_EMISSION_CLASS
+        else ENERGY_EMISSION_CLASS
+    )
+    attributes, default_params = ego_model_defaults(emission_model)
+    attributes.update(
+        {
+            key: value
+            for key, value in vtype.attrib.items()
+            if key not in {"id", "emissionClass", "vClass", "length", "width", "height"}
+        }
+    )
+    default_params.update(
+        {
+            key: value
+            for key, value in params.items()
+            if key not in {"has.battery.device", "carla.blueprint", "device.battery.capacity"}
+        }
+    )
+
+    try:
+        battery_capacity = float(
+            params.get("device.battery.capacity", DEFAULT_EGO_BATTERY_CAPACITY)
+        )
+    except ValueError:
+        battery_capacity = DEFAULT_EGO_BATTERY_CAPACITY
+
+    config.update(
+        {
+            "sumo_vtype": vtype_id,
+            "carla_blueprint": carla_blueprint or DEFAULT_EGO_BLUEPRINT,
+            "emission_model": emission_model,
+            "battery_capacity": battery_capacity,
+            "attributes": attributes,
+            "parameters": default_params,
+        }
+    )
+    return config
+
+
+def read_autoware_ego_vtype_config():
+    config = {
+        "sumo_vtype": AUTOWARE_EGO_VTYPE,
+        "carla_blueprint": AUTOWARE_EGO_VTYPE,
+        "emission_model": ENERGY_EMISSION_CLASS,
+        "battery_capacity": DEFAULT_EGO_BATTERY_CAPACITY,
+        "battery_charge_level": min(5000.0, DEFAULT_EGO_BATTERY_CAPACITY),
+        "attributes": dict(ENERGY_ATTRIBUTE_DEFAULTS),
+        "parameters": dict(ENERGY_PARAM_DEFAULTS),
+    }
+
+    vtype = _read_carla_blueprints_json().get(AUTOWARE_EGO_VTYPE, {})
+    if not vtype:
+        config["attributes"]["color"] = _normalize_color_for_form(
+            config["attributes"].get("color", "white")
+        )
+        return config
+
+    emission_class = vtype.get("emissionClass", "")
+    emission_model = (
+        MMPEVEM_EMISSION_CLASS
+        if emission_class == MMPEVEM_EMISSION_CLASS
+        else ENERGY_EMISSION_CLASS
+    )
+    attributes, default_params = ego_model_defaults(emission_model)
+    attributes.update(
+        {
+            key: value
+            for key, value in vtype.items()
+            if key not in {"vClass", "guiShape", "emissionClass", "params"}
+        }
+    )
+    attributes["color"] = _normalize_color_for_form(attributes.get("color", "white"))
+
+    params = vtype.get("params", {}) if isinstance(vtype.get("params"), dict) else {}
+    default_params.update(
+        {
+            key: value
+            for key, value in params.items()
+            if key not in {
+                "has.battery.device",
+                "carla.blueprint",
+                "device.battery.capacity",
+                "device.battery.chargeLevel",
+            }
+        }
+    )
+
+    try:
+        battery_capacity = float(
+            params.get("device.battery.capacity", DEFAULT_EGO_BATTERY_CAPACITY)
+        )
+    except ValueError:
+        battery_capacity = DEFAULT_EGO_BATTERY_CAPACITY
+
+    try:
+        battery_charge_level = float(
+            params.get("device.battery.chargeLevel", min(5000.0, battery_capacity))
+        )
+    except ValueError:
+        battery_charge_level = min(5000.0, battery_capacity)
+    battery_charge_level = min(max(0.0, battery_charge_level), battery_capacity)
+
+    config.update(
+        {
+            "emission_model": emission_model,
+            "battery_capacity": battery_capacity,
+            "battery_charge_level": battery_charge_level,
+            "attributes": attributes,
+            "parameters": default_params,
+        }
+    )
+    return config
+
+
+def write_ego_vtype_config(
+    carla_blueprint,
+    emission_model,
+    battery_capacity,
+    attributes=None,
+    parameters=None,
+):
+    specs = carla_vehicle_type_specs().get(carla_blueprint, {})
+    attributes = _parameter_payload(attributes)
+    parameters = _parameter_payload(parameters)
+
+    vtype_attributes = {
+        "id": EGO_SUMO_VTYPE,
+        "vClass": specs.get("vClass", "evehicle"),
+        "emissionClass": ego_emission_class_value(emission_model),
+    }
+    for key in ("length", "width", "height", "guiShape"):
+        if specs.get(key):
+            vtype_attributes[key] = specs[key]
+
+    if emission_model == MMPEVEM_EMISSION_CLASS:
+        for key, value in attributes.items():
+            if key in MMPEVEM_ATTRIBUTE_DEFAULTS:
+                vtype_attributes[key] = value
+    else:
+        for key, value in attributes.items():
+            if key in ENERGY_ATTRIBUTE_DEFAULTS:
+                vtype_attributes[key] = value
+
+    root = ET.Element("routes")
+    vtype = ET.SubElement(root, "vType", vtype_attributes)
+
+    base_params = {
+        "has.battery.device": "true",
+        "carla.blueprint": carla_blueprint,
+        "device.battery.capacity": str(float(battery_capacity)),
+    }
+    base_params.update(parameters)
+
+    for key, value in base_params.items():
+        if value is None or str(value).strip() == "":
+            continue
+        ET.SubElement(vtype, "param", {"key": key, "value": str(value)})
+
+    _write_xml(EGO_VTYPE_FILE, root)
+    return EGO_VTYPE_FILE
+
+
+def write_autoware_ego_vtype_config(
+    emission_model,
+    battery_capacity,
+    battery_charge_level,
+    attributes=None,
+    parameters=None,
+):
+    data = _read_carla_vtypes_data()
+    carla_blueprints = data.setdefault("carla_blueprints", {})
+    current_spec = dict(carla_blueprints.get(AUTOWARE_EGO_VTYPE, {}))
+    attributes = _parameter_payload(attributes)
+    parameters = _parameter_payload(parameters)
+
+    vtype_spec = {}
+    if current_spec.get("guiShape"):
+        vtype_spec["guiShape"] = current_spec["guiShape"]
+
+    vtype_spec["vClass"] = "evehicle"
+    vtype_spec["emissionClass"] = ego_emission_class_value(emission_model)
+
+    if emission_model == MMPEVEM_EMISSION_CLASS:
+        allowed_attribute_keys = MMPEVEM_ATTRIBUTE_DEFAULTS
+    else:
+        allowed_attribute_keys = ENERGY_ATTRIBUTE_DEFAULTS
+
+    for key, value in attributes.items():
+        if key not in allowed_attribute_keys:
+            continue
+        if key == "color":
+            normalized_color = _normalize_color_for_storage(value)
+            if normalized_color:
+                vtype_spec[key] = normalized_color
+            continue
+        vtype_spec[key] = value
+
+    vtype_params = {
+        "has.battery.device": "true",
+        "device.battery.capacity": str(float(battery_capacity)),
+        "device.battery.chargeLevel": str(
+            min(max(0.0, float(battery_charge_level)), float(battery_capacity))
+        ),
+    }
+    vtype_params.update(parameters)
+    vtype_spec["params"] = vtype_params
+
+    carla_blueprints[AUTOWARE_EGO_VTYPE] = vtype_spec
+    _write_carla_vtypes_data(data)
+    return CARLA_VTYPES_JSON
+
+
+def map_net_file(map_name=DEFAULT_MAP):
+    return NET_DIR / f"{map_name}.net.xml"
+
+
+def map_route_file(map_name=DEFAULT_MAP):
+    return ROUTE_DIR / f"custom_{map_name}_traffic.rou.xml"
+
+
+def map_trip_file(map_name=DEFAULT_MAP):
+    return ROUTE_DIR / f"custom_{map_name}_traffic.trips.xml"
+
+
+def map_sumocfg_file(map_name=DEFAULT_MAP):
+    return EXAMPLES_DIR / f"custom_{map_name}.sumocfg"
+
+
+def relative_to_examples(path):
+    return path.relative_to(EXAMPLES_DIR).as_posix()
+
+
+def _parse_shape(shape_text):
+    points = []
+    for token in (shape_text or "").split():
+        values = token.split(",")
+        if len(values) < 2:
+            continue
+        points.append((float(values[0]), float(values[1])))
+    return tuple(points)
+
+
+def _lane_allows_road_vehicle(lane):
+    lane_type = lane.get("type")
+    if lane_type == "driving":
+        return True
+
+    allow = set((lane.get("allow") or "").split())
+    disallow = set((lane.get("disallow") or "").split())
+    road_classes = {
+        "passenger",
+        "private",
+        "evehicle",
+        "authority",
+        "emergency",
+        "truck",
+        "motorcycle",
+        "taxi",
+        "bus",
+        "coach",
+        "delivery",
+    }
+
+    if "all" in disallow:
+        return False
+    if allow:
+        return bool(allow & road_classes)
+    return not bool(disallow & {"passenger", "private", "evehicle"})
+
+
+def read_sumo_edges(map_name=DEFAULT_MAP):
+    net_file = map_net_file(map_name)
+    root = ET.parse(net_file).getroot()
+    edges = []
+
+    for edge in root.findall("edge"):
+        edge_id = edge.get("id")
+        if not edge_id or edge_id.startswith(":"):
+            continue
+        if edge.get("function") in {"internal", "walkingarea", "crossing"}:
+            continue
+
+        road_lanes = [lane for lane in edge.findall("lane") if _lane_allows_road_vehicle(lane)]
+        if not road_lanes:
+            continue
+
+        shape = _parse_shape(edge.get("shape")) or _parse_shape(road_lanes[0].get("shape"))
+        if len(shape) < 2:
+            continue
+
+        length = max(float(lane.get("length", "0") or 0) for lane in road_lanes)
+        edges.append(
+            SumoEdge(
+                edge_id=edge_id,
+                from_node=edge.get("from", ""),
+                to_node=edge.get("to", ""),
+                length=length,
+                lane_count=len(road_lanes),
+                shape=shape,
+            )
+        )
+
+    return sorted(edges, key=lambda item: item.edge_id)
+
+
+def edge_label(edge):
+    suffix = "corsia" if edge.lane_count == 1 else "corsie"
+    direction = edge_direction_label(edge)
+    return (
+        f"{edge.edge_id} | {direction} "
+        f"({edge.length:.0f} m, {edge.lane_count} {suffix})"
+    )
+
+
+def edge_direction_label(edge):
+    if len(edge.shape) < 2:
+        return f"{edge.from_node}->{edge.to_node}"
+
+    start = edge.shape[0]
+    end = edge.shape[-1]
+    dx = end[0] - start[0]
+    dy = end[1] - start[1]
+
+    if abs(dx) >= abs(dy):
+        cardinal = "est" if dx >= 0 else "ovest"
+    else:
+        cardinal = "nord" if dy >= 0 else "sud"
+
+    nodes = f"{edge.from_node}->{edge.to_node}" if edge.from_node and edge.to_node else ""
+    coords = f"({start[0]:.0f},{start[1]:.0f}) -> ({end[0]:.0f},{end[1]:.0f})"
+    return f"{nodes} verso {cardinal} {coords}".strip()
+
+
+def opposite_edge_id(edge_id, edge_ids):
+    candidate = edge_id[1:] if edge_id.startswith("-") else f"-{edge_id}"
+    return candidate if candidate in edge_ids else None
+
+
+def edge_direction_options(edges, edge_id):
+    edge_ids = {edge.edge_id for edge in edges}
+    options = [edge_id]
+    opposite = opposite_edge_id(edge_id, edge_ids)
+    if opposite:
+        options.append(opposite)
+    return options
+
+
+def _point_segment_distance(px, py, ax, ay, bx, by):
+    abx = bx - ax
+    aby = by - ay
+    apx = px - ax
+    apy = py - ay
+    denom = abx * abx + aby * aby
+
+    if denom == 0:
+        return math.hypot(px - ax, py - ay)
+
+    t = max(0.0, min(1.0, (apx * abx + apy * aby) / denom))
+    closest_x = ax + t * abx
+    closest_y = ay + t * aby
+    return math.hypot(px - closest_x, py - closest_y)
+
+
+def nearest_edge(edges, x, y):
+    best_edge = None
+    best_distance = float("inf")
+
+    for edge in edges:
+        for start, end in zip(edge.shape, edge.shape[1:]):
+            distance = _point_segment_distance(x, y, start[0], start[1], end[0], end[1])
+            if distance < best_distance:
+                best_edge = edge
+                best_distance = distance
+
+    return best_edge, best_distance
+
+
+def _indent_xml(element, level=0):
+    indent = "\n" + level * "  "
+    child_indent = "\n" + (level + 1) * "  "
+
+    if len(element):
+        if not element.text or not element.text.strip():
+            element.text = child_indent
+        for child in element:
+            _indent_xml(child, level + 1)
+        if not element.tail or not element.tail.strip():
+            element.tail = indent
+    else:
+        if level and (not element.tail or not element.tail.strip()):
+            element.tail = indent
+
+
+def _write_xml(path, root):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _indent_xml(root)
+    tree = ET.ElementTree(root)
+    tree.write(path, encoding="UTF-8", xml_declaration=True)
+
+
+def _build_env():
+    env = os.environ.copy()
+    resolved_sumo_home = _resolve_sumo_home(env)
+    if resolved_sumo_home is not None:
+        env["SUMO_HOME"] = str(resolved_sumo_home)
+
+    api_archive = selected_carla_python_api_archive()
+    if api_archive is not None:
+        existing_pythonpath = [
+            item for item in env.get("PYTHONPATH", "").split(os.pathsep) if item
+        ]
+        filtered_pythonpath = [
+            item
+            for item in existing_pythonpath
+            if "/PythonAPI/carla/dist/" not in item and "site-packages/carla" not in item
+        ]
+        filtered_pythonpath.insert(0, str(api_archive))
+        env["PYTHONPATH"] = os.pathsep.join(filtered_pythonpath)
+
+    library_dirs = (
+        selected_carla_runtime_library_dirs(resolve_carla_python_executable())
+        if api_archive is not None
+        else []
+    )
+    if library_dirs:
+        existing_ld_library_path = [
+            item for item in env.get("LD_LIBRARY_PATH", "").split(os.pathsep) if item
+        ]
+        for library_dir in reversed(library_dirs):
+            if str(library_dir) in existing_ld_library_path:
+                existing_ld_library_path.remove(str(library_dir))
+            existing_ld_library_path.insert(0, str(library_dir))
+        env["LD_LIBRARY_PATH"] = os.pathsep.join(existing_ld_library_path)
+
+    return env
+
+
+def _resolve_sumo_home(env=None):
+    if env is None:
+        env = os.environ
+
+    configured_sumo_home = env.get("SUMO_HOME")
+    if configured_sumo_home:
+        configured_path = Path(configured_sumo_home).expanduser()
+        if configured_path.exists():
+            return configured_path
+
+    default_path = Path(DEFAULT_SUMO_HOME)
+    if default_path.exists():
+        return default_path
+
+    if BUNDLED_SUMO_HOME.exists():
+        return BUNDLED_SUMO_HOME
+
+    return None
+
+
+def _resolve_sumo_tools_dir(env=None):
+    sumo_home = _resolve_sumo_home(env)
+    if sumo_home is not None:
+        tools_dir = sumo_home / "tools"
+        if tools_dir.exists():
+            return tools_dir
+
+    if SUMO_TOOLS_DIR is not None and SUMO_TOOLS_DIR.exists():
+        return SUMO_TOOLS_DIR
+
+    raise FileNotFoundError(
+        "SUMO tools directory not found. Set SUMO_HOME to the SUMO root "
+        "(the directory that contains 'tools' and 'bin')."
+    )
+
+
+def _run_command(cmd, cwd=None):
+    if cwd is None:
+        cwd = SUMO_DIR
+
+    process = subprocess.run(
+        cmd,
+        cwd=str(cwd),
+        env=_build_env(),
+        capture_output=True,
+        text=True,
+    )
+    if process.returncode != 0:
+        raise RuntimeError(
+            "Command failed with exit code "
+            f"{process.returncode}: {' '.join(cmd)}\n{process.stderr}"
+        )
+    return process.stdout, process.stderr
+
+
+def _depart_times(count, begin, end, pattern, rng):
+    if count <= 0:
+        return []
+    if end < begin:
+        end = begin
+
+    normalized_pattern = (pattern or "").strip().lower()
+    if normalized_pattern in {"all together", "tutti subito"}:
+        return [float(begin)] * count
+    if normalized_pattern in {"randomly", "random"}:
+        return sorted(rng.uniform(begin, end) for _ in range(count))
+
+    if count == 1 or end == begin:
+        return [float(begin)] * count
+
+    step = (end - begin) / float(count - 1)
+    return [begin + index * step for index in range(count)]
+
+
+def _vehicle_type_for_trip(rng, vehicle_type, random_vehicle_type, vehicle_types):
+    if random_vehicle_type:
+        choices = vehicle_types or available_vehicle_types()
+        if not choices:
+            raise ValueError("No SUMO vType is available for random vType.")
+
+        return rng.choice(choices)
+
+    return vehicle_type
+
+
+def _write_congestion_trips(
+    trip_file,
+    edges,
+    target_edge,
+    vehicle_count,
+    begin,
+    end,
+    spawn_pattern,
+    destination_edge=None,
+    source_edge=None,
+    seed=42,
+    vehicle_type=DEFAULT_VEHICLE_TYPE,
+    random_vehicle_type=False,
+    vehicle_types=None,
+    candidate_count=None,
+):
+    rng = random.Random(seed)
+    if candidate_count is None:
+        candidate_count = max(vehicle_count * 4, vehicle_count + 20)
+    departures = _depart_times(candidate_count, begin, end, spawn_pattern, rng)
+    edge_ids = [edge.edge_id for edge in edges]
+    source_pool = [
+        edge_id for edge_id in edge_ids if edge_id not in {target_edge, destination_edge}
+    ] or edge_ids
+    destination_pool = [
+        edge_id for edge_id in edge_ids if edge_id not in {target_edge, source_edge}
+    ] or edge_ids
+
+    ET.register_namespace("xsi", XSI_NS)
+    root = ET.Element(
+        "routes",
+        {f"{{{XSI_NS}}}noNamespaceSchemaLocation": "http://sumo.dlr.de/xsd/routes_file.xsd"},
+    )
+
+    for index, depart in enumerate(departures):
+        origin = source_edge or rng.choice(source_pool)
+        destination = destination_edge or rng.choice(
+            [edge_id for edge_id in destination_pool if edge_id != origin] or destination_pool
+        )
+        trip_vehicle_type = _vehicle_type_for_trip(
+            rng,
+            vehicle_type,
+            random_vehicle_type,
+            vehicle_types,
+        )
+        trip = ET.SubElement(
+            root,
+            "trip",
+            {
+                "id": f"congestion_{index}",
+                "depart": f"{depart:.2f}",
+                "from": origin,
+                "to": destination,
+                "type": trip_vehicle_type,
+            },
+        )
+        if target_edge != origin and target_edge != destination:
+            trip.set("via", target_edge)
+
+    _write_xml(trip_file, root)
+
+
+def _count_route_vehicles(route_file, target_edge=None):
+    if not route_file.exists():
+        return 0, 0
+
+    root = ET.parse(route_file).getroot()
+    vehicles = root.findall("vehicle")
+    target_count = 0
+
+    if target_edge:
+        for vehicle in vehicles:
+            route = vehicle.find("route")
+            if route is None:
+                continue
+            if target_edge in (route.get("edges") or "").split():
+                target_count += 1
+
+    return len(vehicles), target_count
+
+
+def _trim_route_file(route_file, max_vehicles):
+    tree = ET.parse(route_file)
+    root = tree.getroot()
+    vehicles = root.findall("vehicle")
+
+    def depart_time(vehicle):
+        try:
+            return float(vehicle.get("depart", "0"))
+        except ValueError:
+            return 0.0
+
+    keep = set(sorted(vehicles, key=depart_time)[:max_vehicles])
+    for vehicle in vehicles:
+        if vehicle not in keep:
+            root.remove(vehicle)
+
+    _write_xml(route_file, root)
+
+
+def _filter_route_file_by_target(route_file, target_edge, max_vehicles=None):
+    tree = ET.parse(route_file)
+    root = tree.getroot()
+    vehicles = root.findall("vehicle")
+    kept = []
+
+    def depart_time(vehicle):
+        try:
+            return float(vehicle.get("depart", "0"))
+        except ValueError:
+            return 0.0
+
+    for vehicle in vehicles:
+        route = vehicle.find("route")
+        route_edges = (route.get("edges") or "").split() if route is not None else []
+        if target_edge in route_edges:
+            kept.append(vehicle)
+
+    kept = sorted(kept, key=depart_time)
+    if max_vehicles is not None:
+        kept = kept[:max_vehicles]
+
+    kept_ids = {id(vehicle) for vehicle in kept}
+    for vehicle in vehicles:
+        if id(vehicle) not in kept_ids:
+            root.remove(vehicle)
+
+    _write_xml(route_file, root)
+
+
+def _assign_random_vehicle_types(route_file, seed=42, vehicle_types=None):
+    choices = vehicle_types or available_vehicle_types()
+    if not choices:
+        raise ValueError("No SUMO vType is available for random vType.")
+
+    rng = random.Random(seed)
+    tree = ET.parse(route_file)
+    root = tree.getroot()
+
+    for vehicle in root.findall("vehicle"):
+        vehicle.set("type", rng.choice(choices))
+
+    _write_xml(route_file, root)
+
+
+def _write_sumocfg(map_name, route_file, sumocfg_file):
+    ET.register_namespace("xsi", XSI_NS)
+    root = ET.Element(
+        "configuration",
+        {f"{{{XSI_NS}}}noNamespaceSchemaLocation": "http://sumo.dlr.de/xsd/sumoConfiguration.xsd"},
+    )
+
+    input_element = ET.SubElement(root, "input")
+    ET.SubElement(input_element, "net-file", {"value": f"net/{map_name}.net.xml"})
+    ET.SubElement(
+        input_element,
+        "route-files",
+        {
+            "value": (
+                "carlavtypes.rou.xml, "
+                "egovtype.xml, "
+                f"{relative_to_examples(route_file)}"
+            )
+        },
+    )
+
+    processing = ET.SubElement(root, "processing")
+    ET.SubElement(processing, "time-to-teleport", {"value": "-1"})
+
+    gui_only = ET.SubElement(root, "gui_only")
+    ET.SubElement(gui_only, "gui-settings-file", {"value": "viewsettings.xml"})
+
+    output = ET.SubElement(root, "output")
+    ET.SubElement(output, "battery-output", {"value": "output/battery.out.xml"})
+    ET.SubElement(output, "tripinfo-output", {"value": "output/tripinfos.xml"})
+    ET.SubElement(output, "vehroute-output", {"value": "output/vehroute.xml"})
+    ET.SubElement(output, "summary-output", {"value": "output/summary.xml"})
+    ET.SubElement(output, "edgedata-output", {"value": "output/edgedata-output.xml"})
+    ET.SubElement(output, "emission-output", {"value": "output/emission-output.xml"})
+
+    _write_xml(sumocfg_file, root)
+
+
+def generate_congestion_scenario(
+    map_name=DEFAULT_MAP,
+    target_edge=None,
+    destination_edge=None,
+    vehicle_count=100,
+    begin=0,
+    end=120,
+    spawn_pattern="Equidistant",
+    source_edge=None,
+    seed=42,
+    vehicle_type=DEFAULT_VEHICLE_TYPE,
+    random_vehicle_type=False,
+    vehicle_types=None,
+):
+    if not target_edge:
+        raise ValueError("Select an edge to congest.")
+
+    edges = read_sumo_edges(map_name)
+    edge_ids = {edge.edge_id for edge in edges}
+    for label, edge_id in {
+        "edge da congestionare": target_edge,
+        "destination edge": destination_edge,
+        "edge sorgente": source_edge,
+    }.items():
+        if edge_id and edge_id not in edge_ids:
+            raise ValueError(f"{label} not present in the map: {edge_id}")
+
+    trip_file = map_trip_file(map_name)
+    route_file = map_route_file(map_name)
+    sumocfg_file = map_sumocfg_file(map_name)
+
+    duarouter = shutil.which("duarouter") or "duarouter"
+    stdout_parts = []
+    stderr_parts = []
+    generated_count = 0
+    target_count = 0
+
+    for attempt, multiplier in enumerate((4, 8, 16, 32), start=1):
+        candidate_count = max(int(vehicle_count) * multiplier, int(vehicle_count) + 20)
+        _write_congestion_trips(
+            trip_file=trip_file,
+            edges=edges,
+            target_edge=target_edge,
+            vehicle_count=int(vehicle_count),
+            begin=float(begin),
+            end=float(end),
+            spawn_pattern=spawn_pattern,
+            destination_edge=destination_edge or None,
+            source_edge=source_edge or None,
+            seed=int(seed) + attempt - 1,
+            vehicle_type=vehicle_type,
+            random_vehicle_type=random_vehicle_type,
+            vehicle_types=vehicle_types,
+            candidate_count=candidate_count,
+        )
+
+        stdout, stderr = _run_command(
+            [
+                duarouter,
+                "-n",
+                str(map_net_file(map_name)),
+                "-r",
+                str(trip_file),
+                "-o",
+                str(route_file),
+                "--ignore-errors",
+                "--no-step-log",
+                "--no-warnings",
+            ]
+        )
+        stdout_parts.append(stdout)
+        stderr_parts.append(stderr)
+
+        _filter_route_file_by_target(route_file, target_edge, int(vehicle_count))
+        generated_count, target_count = _count_route_vehicles(route_file, target_edge)
+        if generated_count >= int(vehicle_count):
+            break
+
+    _write_sumocfg(map_name, route_file, sumocfg_file)
+
+    return ScenarioResult(
+        map_name=map_name,
+        target_edge=target_edge,
+        route_file=route_file,
+        trip_file=trip_file,
+        sumocfg_file=sumocfg_file,
+        command=build_run_command(sumocfg_file),
+        generated_count=generated_count,
+        requested_count=int(vehicle_count),
+        target_count=target_count,
+        mode="duarouter via edge",
+        stdout="\n".join(stdout_parts),
+        stderr="\n".join(stderr_parts),
+    )
+
+
+def generate_random_trips_scenario(
+    map_name=DEFAULT_MAP,
+    vehicle_count=100,
+    begin=0,
+    end=120,
+    seed=42,
+    vehicle_type=DEFAULT_VEHICLE_TYPE,
+    random_vehicle_type=False,
+    vehicle_types=None,
+):
+    if vehicle_count <= 0:
+        raise ValueError("The number of vehicles must be greater than zero.")
+
+    trip_file = map_trip_file(map_name)
+    route_file = map_route_file(map_name)
+    sumocfg_file = map_sumocfg_file(map_name)
+    duration = max(float(end) - float(begin), 1.0)
+    period = max(duration / float(vehicle_count), 0.01)
+    random_trips = _resolve_sumo_tools_dir() / "randomTrips.py"
+
+    stdout, stderr = _run_command(
+        [
+            sys.executable,
+            str(random_trips),
+            "-n",
+            str(map_net_file(map_name)),
+            "-o",
+            str(trip_file),
+            "-r",
+            str(route_file),
+            "-b",
+            str(float(begin)),
+            "-e",
+            str(float(end)),
+            "-p",
+            f"{period:.6f}",
+            "--seed",
+            str(int(seed)),
+            "--edge-permission",
+            "passenger",
+            "--validate",
+            "--trip-attributes",
+            f'type="{vehicle_type}"',
+            "--prefix",
+            "traffic_",
+        ]
+    )
+
+    generated_count, _ = _count_route_vehicles(route_file)
+    if generated_count > vehicle_count:
+        _trim_route_file(route_file, int(vehicle_count))
+        generated_count, _ = _count_route_vehicles(route_file)
+
+    if random_vehicle_type:
+        _assign_random_vehicle_types(route_file, int(seed), vehicle_types)
+
+    _write_sumocfg(map_name, route_file, sumocfg_file)
+
+    return ScenarioResult(
+        map_name=map_name,
+        target_edge="",
+        route_file=route_file,
+        trip_file=trip_file,
+        sumocfg_file=sumocfg_file,
+        command=build_run_command(sumocfg_file),
+        generated_count=generated_count,
+        requested_count=int(vehicle_count),
+        target_count=0,
+        mode="randomTrips",
+        stdout=stdout,
+        stderr=stderr,
+    )
+
+
+def build_run_command(sumocfg_file):
+    python_executable = resolve_carla_python_executable()
+    return [
+        str(python_executable),
+        str(PROJECT_ROOT / "run_dashboard_synchronization.py"),
+        "--carla-version",
+        active_carla_version(),
+        relative_to_sumo_dir(sumocfg_file),
+        "--sumo-gui",
+    ]
+
+
+def relative_to_sumo_dir(path):
+    return path.relative_to(SUMO_DIR).as_posix()
+
+
+def is_carla_server_ready(host=DEFAULT_CARLA_HOST, port=DEFAULT_CARLA_PORT, timeout=1.0):
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def start_carla(log_file=None):
+    if log_file is None:
+        log_file = OUTPUT_DIR / "carla_server.log"
+    if not CARLA_SCRIPT.exists():
+        raise FileNotFoundError(f"CARLA launcher not found: {CARLA_SCRIPT}")
+
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    with open(log_file, "a", encoding="utf-8") as log_handle:
+        log_handle.write(f"\n\n=== CarlaUE4 {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n")
+        log_handle.flush()
+        process = subprocess.Popen(
+            ["./CarlaUE4.sh"],
+            cwd=str(CARLA_DIR),
+            env=_build_env(),
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+
+    return process, log_file
+
+
+def wait_for_carla_server(
+    process=None,
+    host=DEFAULT_CARLA_HOST,
+    port=DEFAULT_CARLA_PORT,
+    timeout=120,
+):
+    deadline = time.time() + timeout
+
+    while time.time() < deadline:
+        if is_carla_server_ready(host, port):
+            time.sleep(3)
+            return
+
+        if process is not None and process.poll() is not None:
+            raise RuntimeError(
+                "CARLA closed before opening port "
+                f"{host}:{port}. Exit code: {process.returncode}"
+            )
+
+        time.sleep(1)
+
+    raise RuntimeError(
+        "Timed out waiting for CARLA on port "
+        f"{host}:{port} after {timeout} seconds."
+    )
+
+
+def load_carla_map(map_name, log_file=None):
+    if log_file is None:
+        log_file = OUTPUT_DIR / "carla_map.log"
+    if not CARLA_CONFIG_SCRIPT.exists():
+        raise FileNotFoundError(f"CARLA map config not found: {CARLA_CONFIG_SCRIPT}")
+
+    python_executable = resolve_carla_python_executable()
+    cmd = [str(python_executable), "PythonAPI/util/config.py", "--map", map_name]
+    process = subprocess.run(
+        cmd,
+        cwd=str(CARLA_DIR),
+        env=_build_env(),
+        capture_output=True,
+        text=True,
+    )
+
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    with open(log_file, "a", encoding="utf-8") as log_handle:
+        log_handle.write(f"\n\n=== load map {map_name} {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n")
+        log_handle.write(" ".join(cmd) + "\n")
+        if process.stdout:
+            log_handle.write(process.stdout)
+        if process.stderr:
+            log_handle.write(process.stderr)
+
+    if process.returncode != 0:
+        raise RuntimeError(
+            "CARLA map loading failed with exit code "
+            f"{process.returncode}: {' '.join(cmd)}\n"
+            f"{process.stderr or process.stdout}"
+        )
+
+    return process.stdout, process.stderr
+
+
+def prepare_carla(map_name, carla_process=None, timeout=120):
+    ensure_carla_python_api_ready()
+
+    process = carla_process
+    carla_started = False
+    carla_log_file = OUTPUT_DIR / "carla_server.log"
+
+    if process is not None and process.poll() is not None:
+        process = None
+
+    if not is_carla_server_ready():
+        if process is None:
+            process, carla_log_file = start_carla()
+            carla_started = True
+        wait_for_carla_server(process=process, timeout=timeout)
+
+    map_stdout, map_stderr = load_carla_map(map_name)
+    return process, carla_log_file, carla_started, map_stdout, map_stderr
+
+
+def start_synchronization(
+    sumocfg_file,
+    map_name=DEFAULT_MAP,
+    ensure_carla=True,
+    carla_process=None,
+    carla_timeout=120,
+    log_file=None,
+):
+    carla_log_file = OUTPUT_DIR / "carla_server.log"
+    carla_started = False
+    map_loaded = False
+    map_stdout = ""
+    map_stderr = ""
+
+    ensure_carla_runner_dependencies_ready()
+
+    if ensure_carla:
+        (
+            carla_process,
+            carla_log_file,
+            carla_started,
+            map_stdout,
+            map_stderr,
+        ) = prepare_carla(
+            map_name,
+            carla_process=carla_process,
+            timeout=carla_timeout,
+        )
+        map_loaded = True
+
+    if log_file is None:
+        log_file = OUTPUT_DIR / "run_dashboard_synchronization.log"
+
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    with open(log_file, "a", encoding="utf-8") as log_handle:
+        log_handle.write(
+            f"\n\n=== run_dashboard_synchronization {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n"
+        )
+        log_handle.flush()
+        sync_process = subprocess.Popen(
+            build_run_command(sumocfg_file),
+            cwd=str(SUMO_DIR),
+            env=_build_env(),
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+
+    return SynchronizationLaunch(
+        sync_process=sync_process,
+        carla_process=carla_process,
+        sync_log_file=log_file,
+        carla_log_file=carla_log_file,
+        carla_started=carla_started,
+        map_loaded=map_loaded,
+        map_stdout=map_stdout,
+        map_stderr=map_stderr,
+    )
