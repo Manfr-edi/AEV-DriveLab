@@ -5,12 +5,18 @@ import json
 import math
 import os
 import random
+import shlex
 import shutil
 import socket
 import subprocess
 import sys
 import time
 import xml.etree.ElementTree as ET
+
+try:
+    import psutil
+except ImportError:  # pragma: no cover - optional runtime dependency
+    psutil = None
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -43,7 +49,7 @@ DEFAULT_SUMO_HOME = "/usr/share/sumo"
 BUNDLED_SUMO_HOME = PROJECT_ROOT / "sumo"
 DEFAULT_CARLA_HOST = "127.0.0.1"
 DEFAULT_CARLA_PORT = 2000
-DEFAULT_AUTOWARE_DOCKER_FILTER = "autoware"
+DEFAULT_AUTOWARE_DOCKER_FILTER = "autoware_mini"
 
 XSI_NS = "http://www.w3.org/2001/XMLSchema-instance"
 
@@ -126,19 +132,119 @@ def _normalize_carla_version(version):
     return normalized
 
 
-def available_carla_versions():
-    versions = []
+def _extract_supported_carla_version(text):
+    if text is None:
+        return None
+
+    normalized = str(text).strip()
     for version in SUPPORTED_CARLA_VERSIONS:
-        if (PROJECT_ROOT / f"CARLA_{version}").exists():
-            versions.append(version)
-    return versions
+        if version in normalized:
+            return version
+    return None
+
+
+def _infer_carla_version_from_dir(carla_dir):
+    version_file = carla_dir / "VERSION"
+    if version_file.exists():
+        try:
+            detected = _extract_supported_carla_version(
+                version_file.read_text(encoding="utf-8", errors="ignore")
+            )
+        except OSError:
+            detected = None
+        if detected:
+            return detected
+
+    detected = _extract_supported_carla_version(carla_dir.name)
+    if detected:
+        return detected
+
+    dist_dir = carla_dir / "PythonAPI" / "carla" / "dist"
+    if dist_dir.exists():
+        for archive in sorted(dist_dir.iterdir()):
+            detected = _extract_supported_carla_version(archive.name)
+            if detected:
+                return detected
+
+    return None
+
+
+def _carla_installation_priority(carla_dir):
+    name = carla_dir.name
+    return (
+        name.lower() != "carla",
+        not name.startswith("CARLA_"),
+        name.lower(),
+    )
+
+
+def _discover_carla_installations():
+    installations = {}
+    candidates = []
+
+    search_roots = [PROJECT_ROOT]
+    nested_root = PROJECT_ROOT / "carla"
+    if nested_root.is_dir():
+        search_roots.append(nested_root)
+
+    for root_dir in search_roots:
+        for child in root_dir.iterdir():
+            if not child.is_dir():
+                continue
+            if not (child / "CarlaUE4.sh").exists():
+                continue
+            if not (child / "Co-Simulation" / "Sumo").exists():
+                continue
+            candidates.append(child)
+
+    for child in PROJECT_ROOT.iterdir():
+        if not child.is_dir():
+            continue
+        if not (child / "CarlaUE4.sh").exists():
+            continue
+        if not (child / "Co-Simulation" / "Sumo").exists():
+            continue
+        candidates.append(child)
+
+    seen = set()
+    unique_candidates = []
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        unique_candidates.append(candidate)
+
+    for carla_dir in sorted(unique_candidates, key=_carla_installation_priority):
+        detected_version = _infer_carla_version_from_dir(carla_dir)
+        if detected_version not in SUPPORTED_CARLA_VERSIONS:
+            continue
+        installations.setdefault(detected_version, carla_dir)
+
+    return installations
+
+
+def available_carla_versions():
+    installations = _discover_carla_installations()
+    return [
+        version
+        for version in SUPPORTED_CARLA_VERSIONS
+        if version in installations
+    ]
 
 
 def carla_paths(version=None):
     normalized = _normalize_carla_version(version)
-    carla_dir = PROJECT_ROOT / f"CARLA_{normalized}"
-    if not carla_dir.exists():
-        raise FileNotFoundError(f"CARLA installation not found: {carla_dir}")
+    installations = _discover_carla_installations()
+    carla_dir = installations.get(normalized)
+    if carla_dir is None:
+        available = ", ".join(
+            f"{detected_version} ({path.name})"
+            for detected_version, path in sorted(installations.items())
+        )
+        raise FileNotFoundError(
+            f"CARLA installation for version {normalized} not found in the project root. "
+            f"Available installations: {available or 'none'}."
+        )
 
     sumo_dir = carla_dir / "Co-Simulation" / "Sumo"
     examples_dir = sumo_dir / "examples"
@@ -363,6 +469,36 @@ def _docker_exec_env():
     return env
 
 
+def _prepare_autoware_x11_access():
+    display = str(os.environ.get("DISPLAY", "")).strip()
+    if not display:
+        raise RuntimeError(
+            "DISPLAY is not set on the host, so the Autoware Docker launch "
+            "cannot prepare X11 access automatically."
+        )
+
+    xhost_binary = shutil.which("xhost")
+    if xhost_binary is None:
+        raise FileNotFoundError("xhost executable not found in PATH.")
+
+    process = subprocess.run(
+        [xhost_binary, "+local:"],
+        env=os.environ.copy(),
+        capture_output=True,
+        text=True,
+    )
+    if process.returncode != 0:
+        raise RuntimeError(
+            "Could not authorize local X11 clients with `xhost +local:`: "
+            f"{process.stderr.strip() or process.stdout.strip()}"
+        )
+
+    return {
+        "display": display,
+        "host_command": "xhost +local:",
+    }
+
+
 def find_running_autoware_container(name_filter=DEFAULT_AUTOWARE_DOCKER_FILTER):
     docker_binary = shutil.which("docker")
     if docker_binary is None:
@@ -372,6 +508,7 @@ def find_running_autoware_container(name_filter=DEFAULT_AUTOWARE_DOCKER_FILTER):
         [
             docker_binary,
             "ps",
+            "-a",
             "--format",
             "{{json .}}",
         ],
@@ -381,7 +518,7 @@ def find_running_autoware_container(name_filter=DEFAULT_AUTOWARE_DOCKER_FILTER):
     )
     if process.returncode != 0:
         raise RuntimeError(
-            f"Could not inspect running Docker containers: {process.stderr.strip() or process.stdout.strip()}"
+            f"Could not inspect Docker containers: {process.stderr.strip() or process.stdout.strip()}"
         )
 
     filter_text = (name_filter or DEFAULT_AUTOWARE_DOCKER_FILTER).strip().lower()
@@ -402,6 +539,8 @@ def find_running_autoware_container(name_filter=DEFAULT_AUTOWARE_DOCKER_FILTER):
             continue
 
         score = (
+            name.lower() == "autoware_mini",
+            search_blob.startswith("autoware_mini "),
             "autoware_mini" in search_blob,
             "autoware" in name.lower(),
             "autoware" in image.lower(),
@@ -410,32 +549,113 @@ def find_running_autoware_container(name_filter=DEFAULT_AUTOWARE_DOCKER_FILTER):
 
     if not candidates:
         raise RuntimeError(
-            f"No running Docker container matching '{filter_text}' was found."
+            f"No Docker container matching '{filter_text}' was found. "
+            "Create/start it first, for example with `docker compose up -d autoware_mini`."
         )
 
     candidates.sort(key=lambda item: item[0], reverse=True)
-    return candidates[0][1]
+    container = candidates[0][1]
+    state = str(container.get("State", "")).strip().lower()
+    if state != "running":
+        container_name = str(container.get("Names") or container.get("ID"))
+        status = str(container.get("Status", "")).strip()
+        raise RuntimeError(
+            f"Docker container '{container_name}' exists but is not active "
+            f"(state: {state or 'unknown'}{', ' + status if status else ''}). "
+            "Start it before launching Autoware."
+        )
+
+    return container
 
 
-def launch_autoware_carla_in_container(map_name, name_filter=DEFAULT_AUTOWARE_DOCKER_FILTER):
+def ensure_autoware_blueprint_available(
+    container_name,
+    blueprint_id=AUTOWARE_EGO_VTYPE,
+    host=DEFAULT_CARLA_HOST,
+    port=DEFAULT_CARLA_PORT,
+):
+    docker_binary = shutil.which("docker")
+    check_script = (
+        "import carla; "
+        f"client = carla.Client({host!r}, {int(port)}); "
+        "client.set_timeout(5.0); "
+        "blueprint_library = client.get_world().get_blueprint_library(); "
+        f"blueprint_library.find({blueprint_id!r}); "
+        "print('OK')"
+    )
+    process = subprocess.run(
+        [
+            docker_binary,
+            "exec",
+            str(container_name),
+            "sh",
+            "-lc",
+            f"python3 -c {shlex.quote(check_script)}",
+        ],
+        env=_docker_exec_env(),
+        capture_output=True,
+        text=True,
+    )
+    if process.returncode == 0:
+        return
+
+    details = (process.stderr.strip() or process.stdout.strip())
+    if "blueprint" in details and "not found" in details:
+        raise RuntimeError(
+            f"CARLA does not provide the required Autoware blueprint '{blueprint_id}'. "
+            "Import the UT Lexus asset into CARLA before launching Autoware."
+        )
+
+    raise RuntimeError(
+        "Could not verify the Autoware CARLA blueprint inside the container: "
+        f"{details or 'unknown error'}"
+    )
+
+
+def launch_autoware_carla_in_container(
+    map_name,
+    name_filter=DEFAULT_AUTOWARE_DOCKER_FILTER,
+    spawn_edge=None,
+):
     map_name = str(map_name).strip()
     if not map_name:
         raise ValueError("A valid map name is required to start Autoware.")
 
+    spawn_details = None
+    if spawn_edge:
+        spawn_details = autoware_spawn_point_from_edge(spawn_edge, map_name=map_name)
+
     container = find_running_autoware_container(name_filter=name_filter)
+    x11_setup = _prepare_autoware_x11_access()
     container_name = container.get("Names") or container.get("ID")
     docker_binary = shutil.which("docker")
+    ensure_autoware_blueprint_available(container_name)
+    spawn_argument = ""
+    if spawn_details is not None:
+        spawn_argument = f" spawn_point:={shlex.quote(spawn_details['spawn_point'])}"
     command = (
-        f"roslaunch autoware_mini start_carla.launch "
-        f"map_name:={map_name} generate_traffic:=false"
+        "source /root/.bashrc && "
+        "source /opt/ros/noetic/setup.bash && "
+        "source /opt/catkin_ws/devel/setup.bash && "
+        f"exec roslaunch autoware_mini start_carla.launch "
+        f"map_name:={shlex.quote(map_name)} generate_traffic:=false"
+        f"{spawn_argument}"
     )
     process = subprocess.run(
         [
             docker_binary,
             "exec",
             "-d",
+            "-e",
+            f"DISPLAY={x11_setup['display']}",
+            "-e",
+            "QT_X11_NO_MITSHM=1",
+            "-e",
+            "XAUTHORITY=/root/.Xauthority",
+            "-w",
+            "/opt/catkin_ws",
             str(container_name),
-            "sh",
+            "bash",
             "-lc",
             command,
         ],
@@ -452,13 +672,24 @@ def launch_autoware_carla_in_container(map_name, name_filter=DEFAULT_AUTOWARE_DO
     return {
         "container_name": str(container_name),
         "container_image": str(container.get("Image", "")),
+        "display": x11_setup["display"],
+        "host_command": x11_setup["host_command"],
         "command": command,
+        "spawn_edge": spawn_details["edge_id"] if spawn_details is not None else None,
+        "spawn_point": spawn_details["spawn_point"] if spawn_details is not None else None,
+        "carla_map": spawn_details["carla_map"] if spawn_details is not None else None,
+        "spawn_projection_mode": (
+            spawn_details["projection_mode"] if spawn_details is not None else None
+        ),
+        "spawn_projection_error": (
+            spawn_details["projection_error"] if spawn_details is not None else None
+        ),
     }
 
 
 set_active_carla_version(
     DEFAULT_CARLA_VERSION
-    if (PROJECT_ROOT / f"CARLA_{DEFAULT_CARLA_VERSION}").exists()
+    if DEFAULT_CARLA_VERSION in available_carla_versions()
     else (available_carla_versions()[0] if available_carla_versions() else DEFAULT_CARLA_VERSION)
 )
 
@@ -911,6 +1142,21 @@ def relative_to_examples(path):
     return path.relative_to(EXAMPLES_DIR).as_posix()
 
 
+def _net_location_offset(map_name=DEFAULT_MAP):
+    root = ET.parse(map_net_file(map_name)).getroot()
+    location = root.find("location")
+    net_offset_text = (
+        location.get("netOffset", "0.0,0.0")
+        if location is not None
+        else "0.0,0.0"
+    )
+    try:
+        offset_x, offset_y = net_offset_text.split(",", 1)
+        return float(offset_x), float(offset_y)
+    except (TypeError, ValueError):
+        return 0.0, 0.0
+
+
 def _parse_shape(shape_text):
     points = []
     for token in (shape_text or "").split():
@@ -1024,6 +1270,151 @@ def edge_direction_options(edges, edge_id):
     if opposite:
         options.append(opposite)
     return options
+
+
+def _point_along_shape(shape, distance_from_start):
+    if len(shape) < 2:
+        raise ValueError("At least two points are required to compute a spawn direction.")
+
+    remaining = max(float(distance_from_start), 0.0)
+    fallback_start = shape[0]
+    fallback_end = shape[1]
+
+    for start, end in zip(shape, shape[1:]):
+        dx = end[0] - start[0]
+        dy = end[1] - start[1]
+        segment_length = math.hypot(dx, dy)
+        if segment_length <= 1e-6:
+            continue
+
+        fallback_start = start
+        fallback_end = end
+
+        if remaining <= segment_length:
+            ratio = remaining / segment_length
+            return (
+                start[0] + dx * ratio,
+                start[1] + dy * ratio,
+                dx,
+                dy,
+            )
+
+        remaining -= segment_length
+
+    return (
+        fallback_end[0],
+        fallback_end[1],
+        fallback_end[0] - fallback_start[0],
+        fallback_end[1] - fallback_start[1],
+    )
+
+
+def _sumo_heading_from_vector(dx, dy):
+    if abs(dx) <= 1e-6 and abs(dy) <= 1e-6:
+        raise ValueError("Could not determine a valid heading from the selected edge.")
+    return (90.0 - math.degrees(math.atan2(dy, dx))) % 360.0
+
+
+def autoware_spawn_point_from_edge(
+    edge_id,
+    map_name=DEFAULT_MAP,
+    host=DEFAULT_CARLA_HOST,
+    port=DEFAULT_CARLA_PORT,
+):
+    edge_id = str(edge_id).strip()
+    if not edge_id:
+        raise ValueError("A valid SUMO edge is required to build an Autoware spawn point.")
+
+    edge = next(
+        (candidate for candidate in read_sumo_edges(map_name) if candidate.edge_id == edge_id),
+        None,
+    )
+    if edge is None:
+        raise ValueError(f"SUMO edge '{edge_id}' is not present in map '{map_name}'.")
+
+    sample_distance = min(max(edge.length * 0.1, 3.0), 12.0)
+    sample_x, sample_y, dx, dy = _point_along_shape(edge.shape, sample_distance)
+    sumo_heading = _sumo_heading_from_vector(dx, dy)
+    fallback_yaw = sumo_heading - 90.0
+    offset_x, offset_y = _net_location_offset(map_name)
+    carla_x = sample_x - offset_x
+    carla_y = -(sample_y - offset_y)
+    fallback_spawn_point = (
+        f"{carla_x:.3f},{carla_y:.3f},0.500,0.000,0.000,{fallback_yaw:.3f}"
+    )
+
+    query_script = (
+        "import warnings; "
+        "warnings.filterwarnings('ignore', message='pkg_resources is deprecated as an API.*'); "
+        "import carla, json; "
+        f"client = carla.Client({host!r}, {int(port)}); "
+        "client.set_timeout(5.0); "
+        "world = client.get_world(); "
+        f"location = carla.Location(x={carla_x!r}, y={carla_y!r}, z=10.0); "
+        "waypoint = world.get_map().get_waypoint("
+        "location, project_to_road=True, lane_type=carla.LaneType.Driving"
+        "); "
+        "assert waypoint is not None, 'no driving waypoint found'; "
+        "transform = waypoint.transform; "
+        "print(json.dumps({"
+        "'world_map': world.get_map().name, "
+        "'x': transform.location.x, "
+        "'y': transform.location.y, "
+        "'z': transform.location.z + 0.5, "
+        "'roll': transform.rotation.roll, "
+        "'pitch': transform.rotation.pitch, "
+        "'yaw': transform.rotation.yaw"
+        "}))"
+    )
+
+    python_executable = resolve_carla_python_executable()
+    try:
+        process = subprocess.run(
+            [
+                str(python_executable),
+                "-c",
+                query_script,
+            ],
+            env=_build_env(),
+            capture_output=True,
+            text=True,
+        )
+    except OSError as exc:
+        details = str(exc)
+    else:
+        if process.returncode == 0:
+            try:
+                waypoint_data = json.loads(process.stdout.strip().splitlines()[-1])
+            except (IndexError, json.JSONDecodeError):
+                details = "Autoware spawn point generation returned an invalid CARLA waypoint payload."
+            else:
+                spawn_point = ",".join(
+                    f"{float(waypoint_data[key]):.3f}"
+                    for key in ("x", "y", "z", "roll", "pitch", "yaw")
+                )
+                return {
+                    "edge_id": edge.edge_id,
+                    "carla_map": str(waypoint_data.get("world_map", "")),
+                    "spawn_point": spawn_point,
+                    "fallback_spawn_point": fallback_spawn_point,
+                    "projection_mode": "nearest_waypoint",
+                    "projection_error": None,
+                }
+        else:
+            details = " | ".join(
+                part
+                for part in (process.stderr.strip(), process.stdout.strip())
+                if part
+            )
+
+    return {
+        "edge_id": edge.edge_id,
+        "carla_map": str(map_name),
+        "spawn_point": fallback_spawn_point,
+        "fallback_spawn_point": fallback_spawn_point,
+        "projection_mode": "sumo_fallback",
+        "projection_error": details or "Could not contact CARLA for waypoint projection.",
+    }
 
 
 def _point_segment_distance(px, py, ax, ay, bx, by):
@@ -1578,6 +1969,150 @@ def is_carla_server_ready(host=DEFAULT_CARLA_HOST, port=DEFAULT_CARLA_PORT, time
         return False
 
 
+def _running_carla_process_entries():
+    if psutil is None:
+        return []
+
+    installations = {
+        version: path.resolve()
+        for version, path in _discover_carla_installations().items()
+    }
+    entries = []
+
+    for process in psutil.process_iter(
+        ["pid", "ppid", "name", "cmdline", "cwd", "exe", "status"]
+    ):
+        try:
+            info = process.info
+            name = info.get("name") or ""
+            cmdline_parts = info.get("cmdline") or []
+            cmdline = " ".join(cmdline_parts)
+            if "CarlaUE4" not in name and "CarlaUE4" not in cmdline:
+                continue
+            cwd = info.get("cwd") or ""
+            exe = info.get("exe") or ""
+        except (psutil.Error, OSError):
+            continue
+
+        matched_version = None
+        matched_dir = None
+        for version, carla_dir in installations.items():
+            carla_dir_text = str(carla_dir)
+            shipping_binary = str(
+                carla_dir / "CarlaUE4" / "Binaries" / "Linux" / "CarlaUE4-Linux-Shipping"
+            )
+            if (
+                cwd == carla_dir_text
+                or cwd.startswith(f"{carla_dir_text}{os.sep}")
+                or shipping_binary in cmdline
+                or shipping_binary == exe
+                or carla_dir_text in cmdline
+            ):
+                matched_version = version
+                matched_dir = carla_dir_text
+                break
+
+        entries.append(
+            {
+                "pid": int(info["pid"]),
+                "ppid": int(info.get("ppid") or 0),
+                "name": name,
+                "cmdline": cmdline,
+                "cwd": cwd,
+                "exe": exe,
+                "status": info.get("status") or "",
+                "version": matched_version,
+                "carla_dir": matched_dir,
+            }
+        )
+
+    return entries
+
+
+def carla_server_status(version=None):
+    selected_version = _normalize_carla_version(version or active_carla_version())
+    processes = _running_carla_process_entries()
+    matched_processes = [item for item in processes if item.get("version")]
+    selected_processes = [
+        item for item in matched_processes if item["version"] == selected_version
+    ]
+    running_versions = sorted({item["version"] for item in matched_processes})
+    ready = is_carla_server_ready()
+    detected_version = None
+
+    if selected_processes:
+        detected_version = selected_version
+    elif len(running_versions) == 1:
+        detected_version = running_versions[0]
+
+    return {
+        "selected_version": selected_version,
+        "running": ready or bool(processes),
+        "ready": ready,
+        "external": ready and not matched_processes,
+        "detected_version": detected_version,
+        "running_versions": running_versions,
+        "processes": processes,
+        "matched_processes": matched_processes,
+        "selected_processes": selected_processes,
+    }
+
+
+def _infer_map_name_from_sumocfg_path(sumocfg_path):
+    if not sumocfg_path:
+        return None
+
+    file_name = Path(str(sumocfg_path)).name
+    if not (file_name.startswith("custom_") and file_name.endswith(".sumocfg")):
+        return None
+
+    candidate = file_name[len("custom_") : -len(".sumocfg")]
+    return candidate if candidate in available_maps() else None
+
+
+def dashboard_synchronization_status():
+    if psutil is None:
+        return {
+            "running": False,
+            "map_name": None,
+            "ambiguous": False,
+            "processes": [],
+        }
+
+    entries = []
+    for process in psutil.process_iter(["pid", "name", "cmdline", "status"]):
+        try:
+            cmdline_parts = [str(part) for part in (process.info.get("cmdline") or [])]
+            joined_cmdline = " ".join(cmdline_parts)
+            if "run_dashboard_synchronization.py" not in joined_cmdline:
+                continue
+        except (psutil.Error, OSError):
+            continue
+
+        sumocfg_file = next(
+            (part for part in cmdline_parts if str(part).endswith(".sumocfg")),
+            "",
+        )
+        entries.append(
+            {
+                "pid": int(process.info["pid"]),
+                "name": process.info.get("name") or "",
+                "status": process.info.get("status") or "",
+                "cmdline": cmdline_parts,
+                "sumocfg_file": sumocfg_file,
+                "map_name": _infer_map_name_from_sumocfg_path(sumocfg_file),
+            }
+        )
+
+    unique_maps = sorted({entry["map_name"] for entry in entries if entry["map_name"]})
+    return {
+        "running": bool(entries),
+        "map_name": unique_maps[0] if len(unique_maps) == 1 else None,
+        "ambiguous": len(unique_maps) > 1,
+        "processes": entries,
+    }
+
+
 def start_carla(log_file=None):
     if log_file is None:
         log_file = OUTPUT_DIR / "carla_server.log"
@@ -1598,6 +2133,98 @@ def start_carla(log_file=None):
         )
 
     return process, log_file
+
+
+def start_carla_server(version=None, timeout=120, log_file=None):
+    selected_version = set_active_carla_version(version)
+    status = carla_server_status(selected_version)
+    if status["running"]:
+        running_version = status.get("detected_version")
+        if running_version:
+            raise RuntimeError(
+                f"CARLA {running_version} is already running on "
+                f"{DEFAULT_CARLA_HOST}:{DEFAULT_CARLA_PORT}."
+            )
+        raise RuntimeError(
+            f"CARLA is already running on {DEFAULT_CARLA_HOST}:{DEFAULT_CARLA_PORT}."
+        )
+
+    process, resolved_log_file = start_carla(log_file=log_file)
+    wait_for_carla_server(process=process, timeout=timeout)
+    return {
+        "version": selected_version,
+        "process": process,
+        "log_file": resolved_log_file,
+    }
+
+
+def stop_carla_server(version=None, timeout=15.0):
+    if psutil is None:
+        raise RuntimeError("psutil is required to stop CARLA from the dashboard.")
+
+    status = carla_server_status(version)
+    selected_version = (
+        _normalize_carla_version(version)
+        if version is not None
+        else status.get("detected_version")
+    )
+
+    if version is None:
+        target_entries = status["matched_processes"]
+    else:
+        target_entries = status["selected_processes"]
+
+    if not target_entries:
+        if status["external"]:
+            raise RuntimeError(
+                "CARLA is listening on port 2000, but the process is not tied to a supported "
+                "local installation. Stop it manually."
+            )
+        if status["running"]:
+            raise RuntimeError(
+                "CARLA appears to be running, but no matching local CARLA process was found."
+            )
+        return {
+            "version": selected_version,
+            "stopped_pids": [],
+            "port_closed": True,
+        }
+
+    processes = []
+    stopped_pids = []
+    for pid in sorted({item["pid"] for item in target_entries}, reverse=True):
+        try:
+            process = psutil.Process(pid)
+        except (psutil.Error, OSError):
+            continue
+        processes.append(process)
+        stopped_pids.append(pid)
+
+    for process in processes:
+        try:
+            process.terminate()
+        except (psutil.Error, OSError):
+            continue
+
+    _, alive = psutil.wait_procs(processes, timeout=max(timeout / 2.0, 1.0))
+    for process in alive:
+        try:
+            process.kill()
+        except (psutil.Error, OSError):
+            continue
+    psutil.wait_procs(alive, timeout=max(timeout / 2.0, 1.0))
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not is_carla_server_ready():
+            break
+        time.sleep(0.5)
+
+    return {
+        "version": selected_version,
+        "stopped_pids": stopped_pids,
+        "port_closed": not is_carla_server_ready(),
+    }
 
 
 def wait_for_carla_server(
@@ -1710,6 +2337,13 @@ def start_synchronization(
             carla_process=carla_process,
             timeout=carla_timeout,
         )
+        map_loaded = True
+    else:
+        if not is_carla_server_ready():
+            raise RuntimeError(
+                f"CARLA is not reachable on {DEFAULT_CARLA_HOST}:{DEFAULT_CARLA_PORT}."
+            )
+        map_stdout, map_stderr = load_carla_map(map_name)
         map_loaded = True
 
     if log_file is None:

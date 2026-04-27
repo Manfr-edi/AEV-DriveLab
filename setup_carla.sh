@@ -2,6 +2,10 @@
 
 set -euo pipefail
 
+UTLEXUS_ASSET_URL="https://github.com/UT-ADL/carla_lexus/releases/download/v0.9.15/utlexus.tar.gz"
+UTLEXUS_ASSET_FILENAME="utlexus.tar.gz"
+UTLEXUS_ASSET_MARKER=".utlexus_asset_imported"
+
 usage() {
     cat <<'EOF'
 Usage:
@@ -15,12 +19,16 @@ What it does:
   - patches the runtime-critical `sumo_simulation.py`
   - patches `create_sumo_vtypes.py` so generated SUMO vTypes keep nested params
   - replaces any remaining `bak_carlavtypes.rou.xml` references with `carlavtypes.rou.xml`
+  - downloads the UT Lexus CARLA asset archive into `Import/` when needed
+  - runs `./ImportAssets.sh` when asset archives are present in `Import/`
+  - removes imported `*.tar.gz` asset archives from `Import/` after a successful import
 
 Notes:
   - `custom_<Town>.sumocfg` files are not required beforehand; the dashboard generates them.
   - the script creates backups under `<CARLA_DIR>/.customcosim-backups/<timestamp>/`.
-  - if `<CARLA_DIR>` is omitted, the script auto-detects `CARLA_0.9.13` / `CARLA_0.9.15`
-    folders inside this repository and bootstraps all the ones it finds.
+  - if `<CARLA_DIR>` is omitted, the script auto-detects `carla/CARLA_*`
+    installations first, then the legacy root-level `CARLA_0.9.13` /
+    `CARLA_0.9.15` folders inside this repository.
 EOF
 }
 
@@ -41,6 +49,54 @@ require_dir() {
 require_file() {
     local path="$1"
     [[ -f "$path" ]] || die "File not found: $path"
+}
+
+is_carla_install_dir() {
+    local path="$1"
+    [[ -d "$path" && -f "$path/CarlaUE4.sh" && -d "$path/Co-Simulation/Sumo" ]]
+}
+
+resolve_carla_dir() {
+    local input_dir="$1"
+    local requested_version="${2:-}"
+    local resolved_input
+    resolved_input="$(cd -- "$input_dir" && pwd)"
+
+    if is_carla_install_dir "$resolved_input"; then
+        echo "$resolved_input"
+        return 0
+    fi
+
+    local nested_candidates=()
+    local nested_dir
+    for nested_dir in \
+        "$resolved_input/CARLA_0.9.13" \
+        "$resolved_input/CARLA_0.9.15"
+    do
+        if is_carla_install_dir "$nested_dir"; then
+            nested_candidates+=("$nested_dir")
+        fi
+    done
+
+    if [[ ${#nested_candidates[@]} -eq 0 ]]; then
+        echo "$resolved_input"
+        return 0
+    fi
+
+    if [[ -n "$requested_version" ]]; then
+        local version_match="$resolved_input/CARLA_$requested_version"
+        if is_carla_install_dir "$version_match"; then
+            echo "$version_match"
+            return 0
+        fi
+        die "Requested CARLA version $requested_version not found under $resolved_input."
+    fi
+
+    if [[ ${#nested_candidates[@]} -gt 1 ]]; then
+        die "Multiple CARLA installations found under $resolved_input. Pass the exact folder or specify the version explicitly."
+    fi
+
+    echo "${nested_candidates[0]}"
 }
 
 detect_version() {
@@ -71,6 +127,18 @@ detect_version() {
             return 0
             ;;
     esac
+
+    local version_file="$carla_dir/VERSION"
+    if [[ -f "$version_file" ]]; then
+        if grep -q "0.9.13" "$version_file"; then
+            echo "0.9.13"
+            return 0
+        fi
+        if grep -q "0.9.15" "$version_file"; then
+            echo "0.9.15"
+            return 0
+        fi
+    fi
 
     local dist_dir="$carla_dir/PythonAPI/carla/dist"
     if [[ -d "$dist_dir" ]]; then
@@ -138,12 +206,133 @@ verify_contains() {
     fi
 }
 
+download_file() {
+    local url="$1"
+    local destination="$2"
+
+    if command -v curl >/dev/null 2>&1; then
+        curl -L --fail --retry 3 --output "$destination" "$url"
+        return 0
+    fi
+
+    if command -v wget >/dev/null 2>&1; then
+        wget -O "$destination" "$url"
+        return 0
+    fi
+
+    python3 - "$url" "$destination" <<'PY'
+import shutil
+import sys
+import urllib.request
+
+url, destination = sys.argv[1], sys.argv[2]
+with urllib.request.urlopen(url) as response, open(destination, "wb") as output:
+    shutil.copyfileobj(response, output)
+PY
+}
+
+ensure_utlexus_asset_archive() {
+    local import_dir="$1"
+    local archive_path="$import_dir/$UTLEXUS_ASSET_FILENAME"
+    local marker_path="$import_dir/$UTLEXUS_ASSET_MARKER"
+    local temp_path="$archive_path.part"
+
+    mkdir -p "$import_dir"
+
+    if [[ -f "$archive_path" ]]; then
+        info "Using existing UT Lexus asset archive at $archive_path"
+        return 0
+    fi
+
+    if [[ -f "$marker_path" ]]; then
+        info "UT Lexus asset already imported for $import_dir; skipping download."
+        return 0
+    fi
+
+    info "Downloading UT Lexus asset archive into $archive_path"
+    rm -f -- "$temp_path"
+    if ! download_file "$UTLEXUS_ASSET_URL" "$temp_path"; then
+        rm -f -- "$temp_path"
+        die "Could not download $UTLEXUS_ASSET_URL"
+    fi
+    mv -- "$temp_path" "$archive_path"
+}
+
+utlexus_asset_installed() {
+    local carla_dir="$1"
+    [[ -f "$carla_dir/CarlaUE4/Content/Carla/Blueprints/Vehicles/Lexus/BP_Lexus.uasset" ]]
+}
+
+import_carla_assets() {
+    local carla_dir="$1"
+    local import_script="$carla_dir/ImportAssets.sh"
+    local import_dir="$carla_dir/Import"
+    local marker_path="$import_dir/$UTLEXUS_ASSET_MARKER"
+    local archives=()
+    local archive
+    local imported_utlexus=0
+    local import_exit_code=0
+
+    if [[ ! -f "$import_script" ]]; then
+        info "Skipping asset import: $import_script not found."
+        return 0
+    fi
+
+    if [[ ! -d "$import_dir" ]]; then
+        mkdir -p "$import_dir"
+        info "Created asset import directory $import_dir"
+    fi
+
+    ensure_utlexus_asset_archive "$import_dir"
+
+    while IFS= read -r -d '' archive; do
+        archives+=("$archive")
+    done < <(find "$import_dir" -maxdepth 1 -type f -name '*.tar.gz' -print0)
+
+    if [[ ${#archives[@]} -eq 0 ]]; then
+        info "No asset archives found in $import_dir; skipping ImportAssets.sh."
+        return 0
+    fi
+
+    info "Running ImportAssets.sh for ${#archives[@]} asset archive(s)."
+    set +e
+    (
+        cd -- "$carla_dir"
+        bash ./ImportAssets.sh
+    )
+    import_exit_code=$?
+    set -e
+
+    if [[ $import_exit_code -ne 0 ]]; then
+        if utlexus_asset_installed "$carla_dir"; then
+            info "ImportAssets.sh exited with code $import_exit_code, but the UT Lexus asset is already present. Continuing with cleanup."
+        else
+            die "ImportAssets.sh failed with exit code $import_exit_code before the UT Lexus asset became available."
+        fi
+    fi
+
+    for archive in "${archives[@]}"; do
+        if [[ "$(basename "$archive")" == "$UTLEXUS_ASSET_FILENAME" ]]; then
+            imported_utlexus=1
+        fi
+        if [[ -f "$archive" ]]; then
+            rm -f -- "$archive"
+            info "Removed imported asset archive $archive"
+        fi
+    done
+
+    if [[ $imported_utlexus -eq 1 ]]; then
+        : > "$marker_path"
+        info "Marked UT Lexus asset as imported in $marker_path"
+    fi
+}
+
 bootstrap_carla_dir() {
     local input_dir="$1"
     local requested_version="${2:-}"
 
     SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-    CARLA_DIR="$(cd -- "$input_dir" && pwd)"
+    CARLA_DIR="$(resolve_carla_dir "$input_dir" "$requested_version")"
     VERSION="$(detect_version "$CARLA_DIR" "$requested_version")"
     TEMPLATE_DIR="$SCRIPT_DIR/bootstrap_templates/$VERSION"
     COMMON_TEMPLATE_DIR="$SCRIPT_DIR/bootstrap_templates/common"
@@ -218,11 +407,22 @@ bootstrap_carla_dir() {
 
     python3 -m py_compile "$BRIDGE_HELPER_PY" "$SUMO_SIMULATION_PY" "$CREATE_SUMO_VTYPES_PY" >/dev/null
 
+    import_carla_assets "$CARLA_DIR"
+
     info "Bootstrap completed for $CARLA_DIR."
     info "The dashboard will generate custom_Town*.sumocfg on demand."
 }
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
+if [[ $# -ge 1 ]]; then
+    case "$1" in
+        -h|--help)
+            usage
+            exit 0
+            ;;
+    esac
+fi
 
 if [[ $# -gt 2 ]]; then
     usage
@@ -235,14 +435,19 @@ if [[ $# -ge 1 ]]; then
 fi
 
 detected_dirs=()
-for version_dir in "$SCRIPT_DIR"/CARLA_0.9.13 "$SCRIPT_DIR"/CARLA_0.9.15; do
-    if [[ -d "$version_dir" ]]; then
-        detected_dirs+=("$version_dir")
+for candidate_dir in \
+    "$SCRIPT_DIR"/carla/CARLA_0.9.13 \
+    "$SCRIPT_DIR"/carla/CARLA_0.9.15 \
+    "$SCRIPT_DIR"/CARLA_0.9.13 \
+    "$SCRIPT_DIR"/CARLA_0.9.15
+do
+    if is_carla_install_dir "$candidate_dir"; then
+        detected_dirs+=("$candidate_dir")
     fi
 done
 
 if [[ ${#detected_dirs[@]} -eq 0 ]]; then
-    die "No local CARLA_0.9.13 or CARLA_0.9.15 directory found next to setup_carla.sh."
+    die "No local CARLA installation found next to setup_carla.sh (expected `carla/CARLA_0.9.13`, `carla/CARLA_0.9.15`, or the legacy root-level directories)."
 fi
 
 for detected_dir in "${detected_dirs[@]}"; do

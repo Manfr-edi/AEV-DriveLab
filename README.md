@@ -1,4 +1,4 @@
-# CustomCoSim
+# AEV-DriveLab
 
 Experimental tool for building and running SUMO-CARLA co-simulation scenarios through a Streamlit dashboard. The project starts from the CARLA 0.9.15 SUMO co-simulation scripts and extends them with an interactive control layer for:
 
@@ -14,10 +14,11 @@ Experimental tool for building and running SUMO-CARLA co-simulation scenarios th
 
 The frontend is implemented in `app.py`.
 
-The dashboard has three sections:
+The dashboard has four sections:
 
 - `Path Setup`: select start/end edges for the ego vehicle, including explicit edge direction selection.
 - `Traffic Scenario`: generate SUMO route files for random traffic or edge-based congestion.
+- `Ego vType`: edit the Autoware-specific ego vehicle configuration. This tab is enabled only when the selected CARLA version is `0.9.13`.
 - `Monitoring`: periodically read ego vehicle state from the Flask backend.
 
 Edge selection is based on the offline SUMO map and displays direction information, for example:
@@ -35,7 +36,7 @@ Scenario generation logic is implemented in `sumo_route_tools.py`.
 
 This module:
 
-- reads `*.net.xml` maps from the selected CARLA installation (`CARLA_0.9.13` or `CARLA_0.9.15`);
+- reads `*.net.xml` maps from the selected CARLA installation (for example `carla/CARLA_0.9.13`, `carla/CARLA_0.9.15`, or the legacy root-level folders);
 - extracts drivable SUMO edges;
 - computes the nearest edge to a map click;
 - generates `.trips.xml` and `.rou.xml` files;
@@ -76,88 +77,142 @@ This keeps the CARLA example runner separate from the dashboard-specific API and
 The dashboard writes generated scenario files to:
 
 ```text
-CARLA_<selected_version>/Co-Simulation/Sumo/examples/rou/custom_<Town>_traffic.trips.xml
-CARLA_<selected_version>/Co-Simulation/Sumo/examples/rou/custom_<Town>_traffic.rou.xml
-CARLA_<selected_version>/Co-Simulation/Sumo/examples/custom_<Town>.sumocfg
+<carla_install_dir>/Co-Simulation/Sumo/examples/rou/custom_<Town>_traffic.trips.xml
+<carla_install_dir>/Co-Simulation/Sumo/examples/rou/custom_<Town>_traffic.rou.xml
+<carla_install_dir>/Co-Simulation/Sumo/examples/custom_<Town>.sumocfg
 ```
 
 Main log files:
 
 ```text
-CARLA_<selected_version>/Co-Simulation/Sumo/examples/output/carla_server.log
-CARLA_<selected_version>/Co-Simulation/Sumo/examples/output/carla_map.log
-CARLA_<selected_version>/Co-Simulation/Sumo/examples/output/run_dashboard_synchronization.log
+<carla_install_dir>/Co-Simulation/Sumo/examples/output/carla_server.log
+<carla_install_dir>/Co-Simulation/Sumo/examples/output/carla_map.log
+<carla_install_dir>/Co-Simulation/Sumo/examples/output/run_dashboard_synchronization.log
 ```
+
+## Tested Environment
+
+This repository is currently tested on:
+
+- Ubuntu `24.04`
+- Python `3.8`
+- Docker
+- Docker Compose
+- SUMO `1.26`
 
 ## Requirements
 
-- Linux.
-- CARLA 0.9.13 and/or CARLA 0.9.15 available in `CARLA_0.9.13` and `CARLA_0.9.15`.
-- SUMO installed, with `sumo`, `sumo-gui`, and `duarouter` available in `PATH`.
-- `SUMO_HOME` configured. If it is not set, the code first attempts `/usr/share/sumo`, then the bundled `./sumo` directory in this repository.
-- Python dependencies listed in `requirements.txt`.
-- A Python interpreter compatible with the bundled CARLA Python API wheels/eggs.
-  In this repository both `CARLA_0.9.13` and `CARLA_0.9.15` ship Python 3.7 builds, so the
-  co-simulation runner must use Python 3.7 even if the Streamlit dashboard runs on a newer Python.
+The minimum setup used to run the project is:
 
-Install Python dependencies:
+- Ubuntu/Linux
+- Python `3.8`
+- Docker and Docker Compose
+- SUMO `1.26`, with `sumo`, `sumo-gui`, `duarouter`, and the SUMO Python tools available
+- Python packages from `requirements.txt`
+- at least one CARLA installation under `carla/`
+
+Install the Python dependencies from the repository root:
 
 ```bash
-cd /home/stefano/PycharmProjects/CustomCoSim
 pip install -r requirements.txt
 ```
 
-If needed:
+If SUMO is installed in the default Ubuntu path, the project should pick it up automatically through `/usr/share/sumo`. If needed, you can still export it explicitly:
 
 ```bash
 export SUMO_HOME=/usr/share/sumo
 ```
 
-If you want to use the SUMO tools bundled in this repository instead of a system install:
+If the CARLA Python API bundled with your CARLA install is not compatible with the interpreter used to start the dashboard, set a dedicated interpreter before launching the project:
 
 ```bash
-export SUMO_HOME="$(pwd)/sumo"
+export CARLA_PYTHON=/path/to/python
 ```
 
-If the dashboard environment is not compatible with CARLA's Python API, set a dedicated CARLA
-interpreter before starting the dashboard:
+or per version:
 
 ```bash
-export CARLA_PYTHON=/path/to/python3.7
+export CARLA_PYTHON_0_9_13=/path/to/python
+export CARLA_PYTHON_0_9_15=/path/to/python
 ```
 
-You can also configure per-version interpreters:
+That interpreter must be able to import at least `carla`, `flask`, `lxml`, `traci`, `sumolib`, and `setuptools`.
+
+## CARLA Setup
+
+At least one CARLA version is required:
+
+- `CARLA 0.9.13`: use this when you want the Autoware workflow.
+  Download: <https://tiny.carla.org/carla-0-9-13-linux>
+- `CARLA 0.9.15`: use this when you want the ego vehicle managed by SUMO instead of Autoware.
+  Download: <https://tiny.carla.org/carla-0-9-15-linux>
+
+You can install one version only, or both.
+
+After downloading, extract the archives inside the repository `carla/` directory, keeping the original folder names intact:
+
+```text
+carla/CARLA_0.9.13
+carla/CARLA_0.9.15
+```
+
+Do not flatten the extracted directories.
+
+Once at least one CARLA installation is in place, run:
 
 ```bash
-export CARLA_PYTHON_0_9_13=/path/to/python3.7
-export CARLA_PYTHON_0_9_15=/path/to/python3.7
+./setup_carla.sh
 ```
 
-That interpreter must have `setuptools` installed, because CARLA's bundled eggs import
-`pkg_resources`.
+The script bootstraps the selected CARLA installation(s), installs the project-specific SUMO/CARLA files, and performs the additional setup needed by this repository.
+
+## Autoware Docker Setup
+
+If you want to use the Autoware workflow, the `autoware_mini` Docker container must exist and be available.
+
+First build:
+
+```bash
+cd autoware_mini_docker_compose
+docker compose up --build
+```
+
+If the image/container is already built, you can simply start it again with:
+
+```bash
+docker start autoware_mini
+```
 
 ## Startup
 
-Start the dashboard:
+After the CARLA setup is complete, start the dashboard from the repository root:
 
 ```bash
-cd /home/stefano/PycharmProjects/CustomCoSim
 streamlit run app.py
 ```
 
-If the default port is already in use:
+If the default Streamlit port is already in use:
 
 ```bash
 streamlit run app.py --server.port 8502
 ```
 
-Open the dashboard in the browser, for example:
+Then open the dashboard in the browser, for example:
 
 ```text
 http://127.0.0.1:8501
 ```
 
-or use the selected port.
+## Typical Local Startup Sequence
+
+Typical startup sequence on a fresh machine:
+
+1. Install system requirements: Python `3.8`, Docker, Docker Compose, SUMO `1.26`.
+2. Install Python packages with `pip install -r requirements.txt`.
+3. Download and extract `CARLA 0.9.13` and/or `CARLA 0.9.15` into `carla/`.
+4. Run `./setup_carla.sh`.
+5. If using Autoware, build/start the Docker container from `autoware_mini_docker_compose/`.
+6. Start the dashboard with `streamlit run app.py`.
 
 ## Typical Workflow
 
@@ -181,21 +236,24 @@ The dashboard creates the route file and the `custom_<Town>.sumocfg` file.
 
 In `Traffic Scenario`, after generating a scenario:
 
-1. Keep `Avvia CARLA e carica la Town prima della sincronizzazione` enabled.
-2. Click `Run co-simulation`.
+1. Make sure the correct `CARLA version` is selected.
+2. Start CARLA with the top-right dashboard button if needed, or let the scenario start it for you.
+3. Click `Run co-simulation`.
 
 The system runs the following sequence:
 
 ```bash
 ./CarlaUE4.sh
-python3 PythonAPI/util/config.py --map Town04
-python3 ../../../run_dashboard_synchronization.py --carla-version <0.9.13|0.9.15> examples/custom_Town04.sumocfg --sumo-gui
+python3 PythonAPI/util/config.py --map <Town>
+python3 ../../../run_dashboard_synchronization.py --carla-version <0.9.13|0.9.15> examples/custom_<Town>.sumocfg --sumo-gui
 ```
+
+Even when a CARLA server is already running, the dashboard still loads the requested Town before launching the SUMO/CARLA synchronization.
 
 The synchronization command is executed from:
 
 ```text
-CARLA_<selected_version>/Co-Simulation/Sumo
+<carla_install_dir>/Co-Simulation/Sumo
 ```
 
 ### 3. Spawn the Ego Vehicle
