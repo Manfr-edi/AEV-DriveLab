@@ -11,6 +11,7 @@ import socket
 import subprocess
 import sys
 import time
+from typing import Optional
 import xml.etree.ElementTree as ET
 
 try:
@@ -22,7 +23,7 @@ except ImportError:  # pragma: no cover - optional runtime dependency
 PROJECT_ROOT = Path(__file__).resolve().parent
 EGO_SUMO_VTYPE = "ego_vehicle_type"
 SUPPORTED_CARLA_VERSIONS = ("0.9.13", "0.9.15")
-DEFAULT_CARLA_VERSION = "0.9.15"
+DEFAULT_CARLA_VERSION = "0.9.13"
 ACTIVE_CARLA_VERSION = None
 
 CARLA_DIR = None
@@ -621,25 +622,21 @@ def launch_autoware_carla_in_container(
     if not map_name:
         raise ValueError("A valid map name is required to start Autoware.")
 
-    spawn_details = None
-    if spawn_edge:
-        spawn_details = autoware_spawn_point_from_edge(spawn_edge, map_name=map_name)
+    # Temporarily disabled: overriding Autoware spawn from a SUMO edge was causing
+    # unreliable launches. Keep the parameter for compatibility, but ignore it.
+    _ = spawn_edge
 
     container = find_running_autoware_container(name_filter=name_filter)
     x11_setup = _prepare_autoware_x11_access()
     container_name = container.get("Names") or container.get("ID")
     docker_binary = shutil.which("docker")
     ensure_autoware_blueprint_available(container_name)
-    spawn_argument = ""
-    if spawn_details is not None:
-        spawn_argument = f" spawn_point:={shlex.quote(spawn_details['spawn_point'])}"
     command = (
         "source /root/.bashrc && "
         "source /opt/ros/noetic/setup.bash && "
         "source /opt/catkin_ws/devel/setup.bash && "
         f"exec roslaunch autoware_mini start_carla.launch "
         f"map_name:={shlex.quote(map_name)} generate_traffic:=false"
-        f"{spawn_argument}"
     )
     process = subprocess.run(
         [
@@ -675,15 +672,11 @@ def launch_autoware_carla_in_container(
         "display": x11_setup["display"],
         "host_command": x11_setup["host_command"],
         "command": command,
-        "spawn_edge": spawn_details["edge_id"] if spawn_details is not None else None,
-        "spawn_point": spawn_details["spawn_point"] if spawn_details is not None else None,
-        "carla_map": spawn_details["carla_map"] if spawn_details is not None else None,
-        "spawn_projection_mode": (
-            spawn_details["projection_mode"] if spawn_details is not None else None
-        ),
-        "spawn_projection_error": (
-            spawn_details["projection_error"] if spawn_details is not None else None
-        ),
+        "spawn_edge": None,
+        "spawn_point": None,
+        "carla_map": None,
+        "spawn_projection_mode": None,
+        "spawn_projection_error": None,
     }
 
 
@@ -730,6 +723,7 @@ class SynchronizationLaunch:
     map_loaded: bool
     map_stdout: str
     map_stderr: str
+    start_gate_file: Optional[Path]
 
 
 def available_maps():
@@ -1945,16 +1939,20 @@ def generate_random_trips_scenario(
     )
 
 
-def build_run_command(sumocfg_file):
+def build_run_command(sumocfg_file, sumo_gui=True, wait_start_file=None):
     python_executable = resolve_carla_python_executable()
-    return [
+    command = [
         str(python_executable),
         str(PROJECT_ROOT / "run_dashboard_synchronization.py"),
         "--carla-version",
         active_carla_version(),
         relative_to_sumo_dir(sumocfg_file),
-        "--sumo-gui",
     ]
+    if sumo_gui:
+        command.append("--sumo-gui")
+    if wait_start_file is not None:
+        command.extend(["--wait-start-file", str(wait_start_file)])
+    return command
 
 
 def relative_to_sumo_dir(path):
@@ -2135,7 +2133,7 @@ def start_carla(log_file=None):
     return process, log_file
 
 
-def start_carla_server(version=None, timeout=120, log_file=None):
+def start_carla_server(version=None, timeout=120, log_file=None, map_name=None):
     selected_version = set_active_carla_version(version)
     status = carla_server_status(selected_version)
     if status["running"]:
@@ -2151,10 +2149,13 @@ def start_carla_server(version=None, timeout=120, log_file=None):
 
     process, resolved_log_file = start_carla(log_file=log_file)
     wait_for_carla_server(process=process, timeout=timeout)
+    if map_name:
+        load_carla_map(map_name)
     return {
         "version": selected_version,
         "process": process,
         "log_file": resolved_log_file,
+        "map_name": map_name,
     }
 
 
@@ -2315,6 +2316,8 @@ def start_synchronization(
     ensure_carla=True,
     carla_process=None,
     carla_timeout=120,
+    sumo_gui=True,
+    wait_for_start=False,
     log_file=None,
 ):
     carla_log_file = OUTPUT_DIR / "carla_server.log"
@@ -2348,15 +2351,28 @@ def start_synchronization(
 
     if log_file is None:
         log_file = OUTPUT_DIR / "run_dashboard_synchronization.log"
+    start_gate_file = None
+    if wait_for_start:
+        start_gate_file = OUTPUT_DIR / "run_dashboard_synchronization.start"
+        try:
+            start_gate_file.unlink(missing_ok=True)
+        except OSError:
+            pass
 
     log_file.parent.mkdir(parents=True, exist_ok=True)
     with open(log_file, "a", encoding="utf-8") as log_handle:
         log_handle.write(
             f"\n\n=== run_dashboard_synchronization {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n"
         )
+        command = build_run_command(
+            sumocfg_file,
+            sumo_gui=sumo_gui,
+            wait_start_file=start_gate_file,
+        )
+        log_handle.write(" ".join(command) + "\n")
         log_handle.flush()
         sync_process = subprocess.Popen(
-            build_run_command(sumocfg_file),
+            command,
             cwd=str(SUMO_DIR),
             env=_build_env(),
             stdout=log_handle,
@@ -2373,4 +2389,5 @@ def start_synchronization(
         map_loaded=map_loaded,
         map_stdout=map_stdout,
         map_stderr=map_stderr,
+        start_gate_file=start_gate_file,
     )

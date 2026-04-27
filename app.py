@@ -6,6 +6,7 @@ import folium
 import time
 import xml.etree.ElementTree as ET
 from datetime import datetime
+from pathlib import Path
 from streamlit_folium import st_folium
 from urllib.parse import quote
 
@@ -25,6 +26,7 @@ from sumo_route_tools import (
     available_maps,
     available_carla_vehicle_types,
     available_vehicle_types,
+    build_run_command,
     current_sumo_dir,
     ego_emission_class_value,
     ego_model_defaults,
@@ -33,8 +35,8 @@ from sumo_route_tools import (
     generate_congestion_scenario,
     generate_random_trips_scenario,
     carla_server_status,
-    dashboard_synchronization_status,
     is_carla_server_ready,
+    load_carla_map,
     nearest_edge,
     opposite_edge_id,
     read_ego_vtype_config,
@@ -51,6 +53,9 @@ from sumo_route_tools import (
 
 API_URL = "http://localhost:5000"
 AUTOWARE_ALLOWED_MAPS = ("Town01", "Town04", "Town05")
+STEP_CARLA_LABEL = "1. Start CARLA"
+STEP_ROUTES_LABEL = "2. Generate SUMO Routes"
+STEP_MONITORING_LABEL = "5. Monitoring"
 EGO_ROUTE_VIA = "Pass through congested edge"
 EGO_ROUTE_FROM_CONGESTION = "Use congested edge as start"
 EGO_ROUTE_TO_CONGESTION = "Use congested edge as destination"
@@ -267,6 +272,7 @@ for key, default in {
     "last_vehicle_state": None,
     "monitoring_started_at": None,
     "traffic_map_name": DEFAULT_MAP,
+    "runtime_map_selection": DEFAULT_MAP,
     "traffic_target_edge": "",
     "traffic_destination_edge": "",
     "traffic_source_edge": "",
@@ -280,8 +286,16 @@ for key, default in {
     "carla_server_action_level": None,
     "carla_server_action_message": None,
     "traffic_carla_mode": None,
+    "traffic_carla_mode_selection": None,
+    "traffic_carla_timeout_seconds": 120,
+    "traffic_carla_timeout_selection": None,
+    "traffic_sumo_gui": True,
+    "traffic_sumo_gui_selection": None,
+    "traffic_waiting_for_autoware": False,
+    "traffic_start_gate_file": None,
     "selected_carla_version": None,
     "applied_carla_version": None,
+    "applied_runtime_map": None,
     "ego_clicked_direction": "",
     "ego_use_traffic_route": False,
     "ego_traffic_route_mode": EGO_ROUTE_VIA,
@@ -304,8 +318,9 @@ for key, default in {
     "autoware_ego_last_emission_model": ENERGY_EMISSION_CLASS,
     "autoware_ego_max_battery_capacity": DEFAULT_EGO_BATTERY_CAPACITY,
     "autoware_ego_initial_battery": min(5000.0, DEFAULT_EGO_BATTERY_CAPACITY),
-    "autoware_manual_map": DEFAULT_MAP,
-    "autoware_spawn_edge": None,
+    "autoware_sync_delay_seconds": 10,
+    "autoware_sync_delay_selection": None,
+    "autoware_last_launch": None,
     "monitor_vehicle_selected_id": None,
     "monitor_vehicle_loaded_for": None,
     "live_vehicle_selected_id": None,
@@ -328,9 +343,12 @@ def apply_selected_carla_version():
         st.stop()
 
     if st.session_state.selected_carla_version not in versions:
-        default_version = active_carla_version()
-        if default_version not in versions:
-            default_version = versions[-1]
+        if "0.9.13" in versions:
+            default_version = "0.9.13"
+        else:
+            default_version = active_carla_version()
+            if default_version not in versions:
+                default_version = versions[-1]
         st.session_state.selected_carla_version = default_version
 
     control_cols = st.columns([1.2, 2.9, 1.3])
@@ -351,6 +369,15 @@ def apply_selected_carla_version():
         st.session_state.autoware_ego_config_version = None
         st.session_state.live_vehicle_config_loaded_for = None
         st.session_state.live_vehicle_config_version = None
+        st.session_state.autoware_last_launch = None
+        gate_file = st.session_state.get("traffic_start_gate_file")
+        if gate_file:
+            try:
+                Path(gate_file).unlink(missing_ok=True)
+            except OSError:
+                pass
+        st.session_state.traffic_waiting_for_autoware = False
+        st.session_state.traffic_start_gate_file = None
 
     st.session_state.applied_carla_version = selected_version
     server_status = carla_server_status(selected_version)
@@ -410,11 +437,13 @@ def apply_selected_carla_version():
                         )
                         level = "error"
                 else:
-                    launch = start_carla_server(selected_version)
+                    selected_map = st.session_state.traffic_map_name
+                    launch = start_carla_server(selected_version, map_name=selected_map)
                     st.session_state.carla_process = launch["process"]
                     st.session_state.carla_process_log = launch["log_file"]
                     message = (
-                        f"CARLA {launch['version']} started, PID {launch['process'].pid}."
+                        f"CARLA {launch['version']} started, PID {launch['process'].pid}, "
+                        f"Town `{selected_map}` loaded."
                     )
                     level = "success"
                 st.session_state.carla_server_action_message = message
@@ -461,6 +490,274 @@ def extract_state_time(state):
             return value
 
     return None
+
+
+def vehicle_setup_step_label():
+    if active_carla_version() == "0.9.13":
+        return "4. Launch Autoware AV"
+    return "3. Spawn SUMO Ego Vehicle"
+
+
+def simulation_step_label():
+    if active_carla_version() == "0.9.13":
+        return "3. Configure Simulation"
+    return "4. Run Simulation"
+
+
+def runtime_map_options():
+    allowed_maps = [map_name for map_name in available_maps() if map_name in AUTOWARE_ALLOWED_MAPS]
+    return allowed_maps or available_maps()
+
+
+def apply_selected_runtime_map():
+    maps = runtime_map_options()
+    if not maps:
+        st.error("No SUMO/CARLA Town is available in the selected installation.")
+        st.stop()
+
+    if st.session_state.traffic_map_name not in maps:
+        st.session_state.traffic_map_name = DEFAULT_MAP if DEFAULT_MAP in maps else maps[0]
+
+    selected_map = st.session_state.traffic_map_name
+    previous_map = st.session_state.applied_runtime_map
+    if previous_map not in (None, selected_map):
+        st.session_state.traffic_generation_result = None
+        st.session_state.traffic_target_edge = ""
+        st.session_state.traffic_destination_edge = ""
+        st.session_state.traffic_source_edge = ""
+        st.session_state.traffic_last_click = None
+        st.session_state.traffic_clicked_direction = ""
+        st.session_state.start_edge = None
+        st.session_state.end_edge = None
+        st.session_state.last_click = None
+        st.session_state.ego_clicked_direction = ""
+        st.session_state.autoware_last_launch = None
+        clear_waiting_synchronization_state(remove_gate_file=True)
+
+    st.session_state.applied_runtime_map = selected_map
+    return selected_map, maps
+
+
+def ensure_simulation_launch_defaults():
+    carla_server_ready = is_carla_server_ready()
+    if st.session_state.traffic_carla_mode is None:
+        st.session_state.traffic_carla_mode = "reuse" if carla_server_ready else "prepare"
+    return carla_server_ready
+
+
+def sync_launch_command_for_ui(sumocfg_file):
+    return build_run_command(
+        sumocfg_file,
+        sumo_gui=bool(st.session_state.traffic_sumo_gui),
+    )
+
+
+def sync_launch_widget_defaults():
+    if st.session_state.traffic_carla_mode_selection not in {"reuse", "prepare"}:
+        st.session_state.traffic_carla_mode_selection = st.session_state.traffic_carla_mode
+    if not isinstance(st.session_state.traffic_sumo_gui_selection, bool):
+        st.session_state.traffic_sumo_gui_selection = bool(st.session_state.traffic_sumo_gui)
+    if not isinstance(st.session_state.traffic_carla_timeout_selection, int):
+        st.session_state.traffic_carla_timeout_selection = int(
+            st.session_state.traffic_carla_timeout_seconds
+        )
+    if not isinstance(st.session_state.autoware_sync_delay_selection, int):
+        st.session_state.autoware_sync_delay_selection = int(
+            st.session_state.autoware_sync_delay_seconds
+        )
+
+
+def autoware_launch_sync_state():
+    launch = st.session_state.autoware_last_launch
+    if not launch:
+        return None
+
+    started_at = launch.get("started_at")
+    if started_at is None:
+        return None
+
+    wait_seconds = int(launch.get("startup_wait_seconds", 0))
+    ready_at = float(started_at) + max(wait_seconds, 0)
+    remaining_seconds = max(0.0, ready_at - time.time())
+    return {
+        "map_name": launch.get("map_name"),
+        "container_name": launch.get("container_name"),
+        "started_at": float(started_at),
+        "startup_wait_seconds": wait_seconds,
+        "ready_at": ready_at,
+        "remaining_seconds": remaining_seconds,
+        "is_ready": remaining_seconds <= 1e-6,
+    }
+
+
+def waiting_for_autoware_sync():
+    sync_process = st.session_state.traffic_process
+    sync_running = sync_process is not None and sync_process.poll() is None
+    if st.session_state.traffic_waiting_for_autoware and not sync_running:
+        clear_waiting_synchronization_state(remove_gate_file=True)
+        return False
+    return bool(st.session_state.traffic_waiting_for_autoware and sync_running)
+
+
+def clear_waiting_synchronization_state(remove_gate_file=False):
+    gate_file = st.session_state.traffic_start_gate_file
+    if remove_gate_file and gate_file:
+        try:
+            Path(gate_file).unlink(missing_ok=True)
+        except OSError:
+            pass
+    st.session_state.traffic_waiting_for_autoware = False
+    st.session_state.traffic_start_gate_file = None
+
+
+def release_waiting_synchronization_gate():
+    gate_file = st.session_state.traffic_start_gate_file
+    if not gate_file:
+        raise RuntimeError("No SUMO start gate is armed for the current session.")
+
+    gate_path = Path(gate_file)
+    gate_path.parent.mkdir(parents=True, exist_ok=True)
+    gate_path.write_text("start\n", encoding="utf-8")
+    clear_waiting_synchronization_state(remove_gate_file=False)
+
+
+def start_dashboard_synchronization_launch(
+    result,
+    carla_mode,
+    carla_timeout,
+    sumo_gui,
+    wait_for_autoware=False,
+):
+    carla_server_ready = is_carla_server_ready()
+    if carla_mode == "reuse" and not carla_server_ready:
+        raise RuntimeError(
+            f"CARLA is not reachable on {DEFAULT_CARLA_HOST}:{DEFAULT_CARLA_PORT}. "
+            "Start CARLA first or switch to 'Start CARLA and load the Town'."
+        )
+
+    launch = start_synchronization(
+        result.sumocfg_file,
+        map_name=result.map_name,
+        ensure_carla=(carla_mode == "prepare"),
+        carla_process=st.session_state.carla_process,
+        carla_timeout=int(carla_timeout),
+        sumo_gui=bool(sumo_gui),
+        wait_for_start=bool(wait_for_autoware),
+    )
+
+    st.session_state.traffic_process = launch.sync_process
+    st.session_state.traffic_process_log = launch.sync_log_file
+    st.session_state.carla_process = launch.carla_process
+    st.session_state.carla_process_log = launch.carla_log_file
+    st.session_state.traffic_waiting_for_autoware = launch.start_gate_file is not None
+    st.session_state.traffic_start_gate_file = (
+        str(launch.start_gate_file) if launch.start_gate_file is not None else None
+    )
+    return launch
+
+
+def synchronization_success_message(launch, result, carla_mode, sumo_gui):
+    if launch.start_gate_file is not None:
+        message = (
+            f"SUMO/CARLA bridge started, PID {launch.sync_process.pid}, "
+            "and is waiting for Autoware before simulation time advances."
+        )
+    else:
+        message = f"Co-simulation started, PID {launch.sync_process.pid}."
+    if carla_mode == "reuse":
+        message += (
+            f" Using CARLA already running on "
+            f"{DEFAULT_CARLA_HOST}:{DEFAULT_CARLA_PORT}."
+        )
+    if launch.map_loaded:
+        message += f" Town {result.map_name} loaded."
+    if carla_mode != "reuse" and launch.carla_started:
+        message += " CARLA started."
+    message += " SUMO GUI enabled." if sumo_gui else " SUMO running headless."
+    return message
+
+
+def render_carla_step():
+    selected_version = active_carla_version()
+    status = carla_server_status(selected_version)
+    sync_process = st.session_state.traffic_process
+    sync_running = sync_process is not None and sync_process.poll() is None
+    selected_map, maps = apply_selected_runtime_map()
+    if st.session_state.runtime_map_selection not in maps:
+        st.session_state.runtime_map_selection = selected_map
+
+    st.subheader("🚘 Start CARLA")
+    st.caption(
+        "Select the Town here. All following steps use this Town and no longer expose a separate map selector."
+    )
+
+    town_cols = st.columns([2, 3])
+    with town_cols[0]:
+        selected_map_choice = st.selectbox(
+            "Selected Town",
+            options=maps,
+            index=edge_select_index(maps, st.session_state.runtime_map_selection),
+            key="runtime_map_selection",
+            disabled=sync_running,
+        )
+    with town_cols[1]:
+        if sync_running:
+            st.caption(
+                "The Town selector is locked while the co-simulation is running."
+            )
+        else:
+            st.caption(
+                "This Town will be used by SUMO route generation, Autoware launch, and the co-simulation startup."
+            )
+
+    if selected_map_choice != st.session_state.traffic_map_name:
+        st.session_state.traffic_map_name = selected_map_choice
+    selected_map, _ = apply_selected_runtime_map()
+
+    if status["running"]:
+        detected_version = status.get("detected_version")
+        if detected_version:
+            st.success(
+                f"CARLA server is active on `{DEFAULT_CARLA_HOST}:{DEFAULT_CARLA_PORT}` "
+                f"for version `{detected_version}`."
+            )
+        else:
+            st.success(
+                f"CARLA server is active on `{DEFAULT_CARLA_HOST}:{DEFAULT_CARLA_PORT}`."
+            )
+    else:
+        st.warning(
+            f"CARLA is not running on `{DEFAULT_CARLA_HOST}:{DEFAULT_CARLA_PORT}`."
+        )
+
+    if status["running"] and status.get("detected_version") not in (None, selected_version):
+        st.warning(
+            f"The selected version is `{selected_version}`, but the running CARLA server "
+            f"was detected as `{status['detected_version']}`."
+        )
+
+    info_cols = st.columns(3)
+    info_cols[0].metric("Selected CARLA", selected_version)
+    info_cols[1].metric("Selected Town", selected_map)
+    info_cols[2].metric("Status", "Running" if status["running"] else "Stopped")
+
+    if status["running"]:
+        load_cols = st.columns([1, 3])
+        with load_cols[0]:
+            if st.button("Load selected Town", use_container_width=True):
+                try:
+                    with st.spinner(f"Loading `{selected_map}` in CARLA..."):
+                        load_carla_map(selected_map)
+                    st.success(f"Town `{selected_map}` loaded in CARLA.")
+                except Exception as exc:
+                    st.error(f"Town load failed: {exc}")
+        with load_cols[1]:
+            st.caption(
+                "Use this if CARLA is already running and you want to force the selected Town before the next steps."
+            )
+
+    if st.session_state.carla_process_log:
+        st.caption(f"CARLA Log: {st.session_state.carla_process_log}")
 
 
 def reset_monitoring_trip_state():
@@ -858,63 +1155,6 @@ def initialize_autoware_ego_config_state():
     st.session_state.autoware_ego_config_version = current_version
 
 
-def resolve_autoware_launch_map():
-    allowed_maps = [map_name for map_name in available_maps() if map_name in AUTOWARE_ALLOWED_MAPS]
-    if not allowed_maps:
-        allowed_maps = available_maps()
-
-    default_manual_map = DEFAULT_MAP if DEFAULT_MAP in allowed_maps else allowed_maps[0]
-    if st.session_state.autoware_manual_map not in allowed_maps:
-        st.session_state.autoware_manual_map = default_manual_map
-
-    traffic_result = st.session_state.traffic_generation_result
-    traffic_process = st.session_state.traffic_process
-    if (
-        traffic_process is not None
-        and traffic_process.poll() is None
-        and traffic_result is not None
-        and traffic_result.map_name in allowed_maps
-    ):
-        return {
-            "map_name": traffic_result.map_name,
-            "allowed_maps": allowed_maps,
-            "source": "session_sync",
-            "status_message": (
-                f"Autoware launch map locked to the running co-simulation: `{traffic_result.map_name}`."
-            ),
-        }
-
-    sync_status = dashboard_synchronization_status()
-    if sync_status["running"] and sync_status.get("map_name") in allowed_maps:
-        return {
-            "map_name": sync_status["map_name"],
-            "allowed_maps": allowed_maps,
-            "source": "system_sync",
-            "status_message": (
-                f"Autoware launch map locked to the running SUMO/CARLA process: `{sync_status['map_name']}`."
-            ),
-        }
-
-    if sync_status.get("ambiguous"):
-        return {
-            "map_name": st.session_state.autoware_manual_map,
-            "allowed_maps": allowed_maps,
-            "source": "manual",
-            "status_message": (
-                "Multiple co-simulation processes were detected. Select the Autoware map manually."
-            ),
-        }
-
-    return {
-        "map_name": st.session_state.autoware_manual_map,
-        "allowed_maps": allowed_maps,
-        "source": "manual",
-        "status_message": (
-            "No SUMO/CARLA co-simulation is running. Select the Autoware map manually."
-        ),
-    }
-
-
 def reset_vtype_model_state(prefix, emission_model):
     attributes, parameters = ego_model_defaults(emission_model)
 
@@ -1073,41 +1313,21 @@ def render_autoware_ego_vtype_editor():
     st.caption(
         f"The Autoware Docker launch currently expects the CARLA blueprint `{AUTOWARE_EGO_VTYPE}`."
     )
-    autoware_map_context = resolve_autoware_launch_map()
-    selected_map_name = autoware_map_context["map_name"]
-    allowed_maps = autoware_map_context["allowed_maps"]
-    manual_map_selection = autoware_map_context["source"] == "manual"
-    map_cols = st.columns([2, 3])
-    with map_cols[0]:
-        if manual_map_selection:
-            selected_map_name = st.selectbox(
-                "Autoware launch map",
-                options=allowed_maps,
-                index=edge_select_index(allowed_maps, selected_map_name),
-                key="autoware_manual_map",
-            )
-        else:
-            st.selectbox(
-                "Autoware launch map",
-                options=allowed_maps,
-                index=edge_select_index(allowed_maps, selected_map_name),
-                disabled=True,
-            )
-    with map_cols[1]:
-        st.caption(autoware_map_context["status_message"])
-
-    edges = get_offline_edges(selected_map_name)
-    edge_ids = [edge.edge_id for edge in edges]
-    edge_id_set = set(edge_ids)
-    edge_labels = {edge.edge_id: edge_label(edge) for edge in edges}
-    if st.session_state.autoware_spawn_edge not in edge_id_set:
-        if st.session_state.start_edge in edge_id_set:
-            st.session_state.autoware_spawn_edge = st.session_state.start_edge
-        else:
-            st.session_state.autoware_spawn_edge = edge_ids[0] if edge_ids else None
+    if st.session_state.autoware_last_launch:
+        last_launch = st.session_state.autoware_last_launch
+        st.caption(
+            f"Last Autoware launch: map `{last_launch.get('map_name', '-')}`, "
+            f"container `{last_launch.get('container_name', '-')}`."
+        )
+    selected_map_name, _ = apply_selected_runtime_map()
     st.caption(
-        f"Autoware launch map: `{selected_map_name}`."
+        f"Autoware launch map fixed to `{selected_map_name}` from step 1."
     )
+    scenario_result = st.session_state.traffic_generation_result
+    sync_process = st.session_state.traffic_process
+    sync_running = sync_process is not None and sync_process.poll() is None
+    sync_waiting_for_autoware = waiting_for_autoware_sync()
+    autoware_delay = int(st.session_state.autoware_sync_delay_seconds)
 
     top_cols = st.columns([2, 1, 1])
     with top_cols[0]:
@@ -1149,28 +1369,9 @@ def render_autoware_ego_vtype_editor():
         reset_vtype_model_state("autoware_ego", emission_model)
         st.session_state.autoware_ego_last_emission_model = emission_model
 
-    if edge_ids:
-        spawn_cols = st.columns([3, 1])
-        with spawn_cols[0]:
-            spawn_edge = st.selectbox(
-                "Autoware spawn edge",
-                options=edge_ids,
-                index=edge_select_index(edge_ids, st.session_state.autoware_spawn_edge),
-                format_func=lambda value: edge_labels[value],
-                key="autoware_spawn_edge",
-            )
-        with spawn_cols[1]:
-            use_start_disabled = st.session_state.start_edge not in edge_id_set
-            if st.button("Use current START", disabled=use_start_disabled):
-                st.session_state.autoware_spawn_edge = st.session_state.start_edge
-                st.rerun()
-        st.caption(
-            "The selected SUMO edge is projected onto the nearest CARLA driving waypoint "
-            "and passed to Autoware as `spawn_point`."
-        )
-    else:
-        spawn_edge = None
-        st.warning("No drivable SUMO edge is available for the selected map.")
+    # Temporarily disabled: overriding the Autoware spawn point from a SUMO edge
+    # was causing unreliable launches. The Docker launch now uses Autoware defaults.
+    st.caption("Custom Autoware spawn-point override is temporarily disabled.")
 
     attribute_defaults, parameter_defaults = ego_model_defaults(emission_model)
 
@@ -1190,12 +1391,31 @@ def render_autoware_ego_vtype_editor():
     st.info(
         "If CARLA does not have the UT Lexus asset imported, the Docker launch will fail before spawning the ego vehicle."
     )
+    if scenario_result is None:
+        st.caption("Generate a SUMO scenario in step 2 before starting the synchronized launch.")
+    else:
+        gui_label = "enabled" if st.session_state.traffic_sumo_gui else "disabled"
+        st.caption(
+            f"Step 3 will reuse the running CARLA instance on map `{scenario_result.map_name}` "
+            f"with SUMO GUI {gui_label}."
+        )
+    if sync_waiting_for_autoware:
+        st.info(
+            "SUMO/CARLA is already armed from step 3 and waiting for Autoware. "
+            "Click `Run Autoware` to start the warm-up and then release the simulation."
+        )
+    st.caption(
+        f"The configured Autoware startup wait is `{autoware_delay}s` and starts when you click `Run Autoware`."
+    )
 
     action_cols = st.columns(2)
     with action_cols[0]:
         save_clicked = st.button("Save ego vType in vtypes.json")
     with action_cols[1]:
-        launch_clicked = st.button("Run Autoware in Docker")
+        launch_clicked = st.button(
+            "Run Autoware",
+            disabled=sync_running and not sync_waiting_for_autoware,
+        )
 
     if save_clicked or launch_clicked:
         write_autoware_ego_vtype_config(
@@ -1210,41 +1430,53 @@ def render_autoware_ego_vtype_editor():
 
     if launch_clicked:
         try:
-            launch = launch_autoware_carla_in_container(
-                selected_map_name,
-                spawn_edge=spawn_edge,
-            )
-            st.success(
-                f"Autoware launch started in container `{launch['container_name']}` "
-                f"for map `{selected_map_name}`."
-            )
-            st.caption(f"Host prep: `{launch['host_command']}` with `DISPLAY={launch['display']}`")
-            if launch.get("spawn_edge"):
-                st.caption(f"Spawn edge: `{launch['spawn_edge']}`")
-            if launch.get("spawn_point"):
-                spawn_point_label = (
-                    "Projected CARLA spawn point"
-                    if launch.get("spawn_projection_mode") == "nearest_waypoint"
-                    else "Fallback CARLA spawn point"
-                )
-                st.caption(
-                    f"{spawn_point_label}: `{launch['spawn_point']}`"
-                    + (
-                        f" on map `{launch['carla_map']}`"
-                        if launch.get("carla_map")
-                        else ""
-                    )
-                )
-            if launch.get("spawn_projection_mode") == "sumo_fallback":
-                st.warning(
-                    "The selected edge could not be projected onto a live CARLA waypoint. "
-                    "Autoware was started with a SUMO-derived fallback spawn point."
-                )
-                if launch.get("spawn_projection_error"):
-                    st.caption(f"Projection fallback reason: `{launch['spawn_projection_error']}`")
-            st.caption(f"Executed: `{launch['command']}`")
+            started_at = time.time()
+            launch = launch_autoware_carla_in_container(selected_map_name)
+            st.session_state.autoware_last_launch = {
+                "map_name": selected_map_name,
+                "container_name": launch.get("container_name"),
+                "command": launch.get("command"),
+                "started_at": started_at,
+                "startup_wait_seconds": autoware_delay,
+            }
         except Exception as exc:
             st.error(f"Autoware start failed: {exc}")
+            return {
+                "sumo_vtype": AUTOWARE_EGO_VTYPE,
+                "carla_blueprint": AUTOWARE_EGO_VTYPE,
+                "emission_model": emission_model,
+                "battery_capacity": battery_capacity,
+                "battery_charge_level": battery_charge_level,
+                "attributes": attributes,
+                "parameters": parameters,
+                "emission_class": ego_emission_class_value(emission_model),
+            }
+
+        st.success(
+            f"Autoware launch started in container `{launch['container_name']}` "
+            f"for map `{selected_map_name}`."
+        )
+        st.caption(f"Host prep: `{launch['host_command']}` with `DISPLAY={launch['display']}`")
+        st.caption(f"Executed: `{launch['command']}`")
+        if sync_waiting_for_autoware:
+            try:
+                with st.spinner(
+                    f"Waiting {autoware_delay}s for Autoware startup, then releasing the SUMO/CARLA simulation..."
+                ):
+                    time.sleep(max(0, autoware_delay))
+                    if not waiting_for_autoware_sync():
+                        raise RuntimeError(
+                            "SUMO/CARLA is no longer waiting for Autoware. "
+                            "The synchronization process may have stopped."
+                        )
+                    release_waiting_synchronization_gate()
+                st.success("Autoware warm-up completed. SUMO/CARLA simulation released.")
+            except Exception as exc:
+                st.error(f"Autoware started, but the SUMO release failed: {exc}")
+        else:
+            st.caption(
+                f"Warm-up timer started now. Step 3 can start the simulation after `{autoware_delay}s`."
+            )
 
     return {
         "sumo_vtype": AUTOWARE_EGO_VTYPE,
@@ -1441,7 +1673,7 @@ def resolve_ego_route_from_congestion(
     return start_edge, end_edge, via_edge, auto_fields
 
 
-def render_traffic_scenario():
+def render_traffic_scenario(show_runner=True):
     st.subheader("🚦 Traffic Scenario")
 
     maps = available_maps()
@@ -1449,13 +1681,9 @@ def render_traffic_scenario():
         st.error("No SUMO map found in examples/net.")
         return
 
-    if st.session_state.traffic_map_name not in maps:
-        st.session_state.traffic_map_name = DEFAULT_MAP if DEFAULT_MAP in maps else maps[0]
-
-    map_name = st.selectbox(
-        "Offline map",
-        options=maps,
-        key="traffic_map_name",
+    map_name, _ = apply_selected_runtime_map()
+    st.caption(
+        f"Scenario Town fixed to `{map_name}` from step 1."
     )
 
     edges = get_offline_edges(map_name)
@@ -1750,137 +1978,156 @@ def render_traffic_scenario():
         st.write("Trips file:", str(result.trip_file))
         st.write("SUMO cfg:", str(result.sumocfg_file))
         st.code(
-            "cd " + str(current_sumo_dir()) + "\n" + " ".join(result.command),
+            "cd " + str(current_sumo_dir()) + "\n" + " ".join(sync_launch_command_for_ui(result.sumocfg_file)),
             language="bash",
         )
 
-        sync_process = st.session_state.traffic_process
-        sync_running = sync_process is not None and sync_process.poll() is None
-        carla_process = st.session_state.carla_process
-        managed_carla_running = carla_process is not None and carla_process.poll() is None
-        carla_server_ready = is_carla_server_ready()
+        if show_runner:
+            render_simulation_runner(result)
 
-        if st.session_state.traffic_carla_mode is None:
-            st.session_state.traffic_carla_mode = "reuse" if carla_server_ready else "prepare"
 
-        carla_mode = st.radio(
-            "CARLA startup mode",
-            options=["reuse", "prepare"],
-            format_func=lambda mode: {
-                "reuse": "Use running CARLA (only start SUMO)",
-                "prepare": "Start CARLA and load the Town",
-            }[mode],
-            key="traffic_carla_mode",
-            horizontal=True,
+def render_simulation_runner(result=None):
+    if result is None:
+        result = st.session_state.traffic_generation_result
+
+    autoware_workflow = active_carla_version() == "0.9.13"
+    st.subheader("▶️ Configure Simulation" if autoware_workflow else "▶️ Run Simulation")
+    if result is None:
+        st.warning(
+            "Generate a SUMO route scenario first in step 2 before starting the co-simulation."
         )
+        return
 
-        if carla_server_ready:
-            st.caption(
-                f"CARLA server detected on {DEFAULT_CARLA_HOST}:{DEFAULT_CARLA_PORT}. "
-                "In 'Use running CARLA' mode the dashboard will only launch the SUMO/co-simulation process."
+    sync_process = st.session_state.traffic_process
+    sync_running = sync_process is not None and sync_process.poll() is None
+    carla_server_ready = is_carla_server_ready()
+    sync_launch_widget_defaults()
+
+    if autoware_workflow:
+        st.caption(
+            f"Scenario ready for map `{result.map_name}`. "
+            "These settings will be reused in step 4 when the dashboard starts the SUMO/CARLA synchronization."
+        )
+    else:
+        st.caption(
+            f"Scenario ready for map `{result.map_name}`. "
+            "This step loads the correct Town in CARLA and then starts the SUMO/CARLA synchronization."
+        )
+    if autoware_workflow:
+        st.info(
+            "For the Autoware workflow, this step starts the SUMO/CARLA bridge in standby. "
+            "Then use step 4 to launch Autoware; after the warm-up, the simulation is released automatically."
+        )
+        if waiting_for_autoware_sync():
+            st.success(
+                "SUMO/CARLA bridge is running and waiting for Autoware before advancing simulation time."
             )
+            launch_state = autoware_launch_sync_state()
+            if launch_state is None:
+                st.info("Autoware has not been launched from step 4 yet.")
+            elif launch_state["is_ready"]:
+                st.success(
+                    f"Autoware launched in container `{launch_state['container_name']}`. "
+                    "Warm-up completed."
+                )
+            else:
+                st.info(
+                    f"Autoware launched in container `{launch_state['container_name']}`. "
+                    f"{launch_state['remaining_seconds']:.1f}s of startup wait remain."
+                )
         else:
-            st.caption(
-                f"No CARLA server detected on {DEFAULT_CARLA_HOST}:{DEFAULT_CARLA_PORT}. "
-                "Use 'Start CARLA and load the Town' or start CARLA manually first."
-            )
+            st.warning("Start simulation here first to arm SUMO/CARLA, then launch Autoware from step 4.")
 
-        ensure_carla = carla_mode == "prepare"
-        carla_timeout = st.number_input(
-            "Timeout CARLA run [s]",
-            min_value=30,
-            max_value=300,
-            value=120,
-            step=10,
-            disabled=not ensure_carla,
+    sumo_gui = st.checkbox(
+        "SUMO GUI",
+        key="traffic_sumo_gui_selection",
+        help="Disable this to run SUMO headless.",
+    )
+    if autoware_workflow:
+        st.number_input(
+            "Autoware startup wait [s]",
+            min_value=0,
+            max_value=120,
+            step=1,
+            key="autoware_sync_delay_selection",
+            help="Delay applied in step 4 before the co-simulation process is started.",
+        )
+    st.session_state.traffic_carla_mode = "reuse"
+    st.session_state.traffic_sumo_gui = bool(st.session_state.traffic_sumo_gui_selection)
+    if autoware_workflow:
+        st.session_state.autoware_sync_delay_seconds = int(
+            st.session_state.autoware_sync_delay_selection
         )
 
-        run_cols = st.columns(3)
-        with run_cols[0]:
-            if st.button("Run co-simulation", disabled=sync_running):
-                try:
-                    if carla_mode == "reuse" and not carla_server_ready:
-                        raise RuntimeError(
-                            f"CARLA is not reachable on {DEFAULT_CARLA_HOST}:{DEFAULT_CARLA_PORT}. "
-                            "Start CARLA first or switch to 'Start CARLA and load the Town'."
-                        )
+    if carla_server_ready:
+        st.caption(
+            f"CARLA server detected on {DEFAULT_CARLA_HOST}:{DEFAULT_CARLA_PORT}. "
+            "The dashboard will still load the scenario Town before starting the co-simulation."
+        )
+    else:
+        st.caption(
+            f"No CARLA server detected on {DEFAULT_CARLA_HOST}:{DEFAULT_CARLA_PORT}. "
+            "Start CARLA from step 1 before running the co-simulation."
+        )
 
-                    spinner_message = (
-                        "Starting SUMO/co-simulation with the running CARLA instance..."
-                        if carla_mode == "reuse"
-                        else "Setting up CARLA and starting co-simulation..."
+    run_cols = st.columns(2)
+    with run_cols[0]:
+        if st.button(
+            "Start simulation" if autoware_workflow else "Run co-simulation",
+            disabled=sync_running,
+        ):
+            try:
+                spinner_message = (
+                    "Loading the selected Town and arming SUMO/CARLA while waiting for Autoware..."
+                    if autoware_workflow
+                    else "Loading the selected Town and starting SUMO/co-simulation..."
+                )
+
+                with st.spinner(spinner_message):
+                    launch = start_dashboard_synchronization_launch(
+                        result,
+                        carla_mode="reuse",
+                        carla_timeout=int(st.session_state.traffic_carla_timeout_seconds),
+                        sumo_gui=sumo_gui,
+                        wait_for_autoware=autoware_workflow,
                     )
+                st.success(
+                    synchronization_success_message(
+                        launch,
+                        result,
+                        carla_mode="reuse",
+                        sumo_gui=sumo_gui,
+                    )
+                )
+            except Exception as exc:
+                st.error(f"Start failed: {exc}")
+    with run_cols[1]:
+        if st.button("Stop co-simulation", disabled=not sync_running):
+            sync_process.terminate()
+            st.session_state.traffic_process = None
+            clear_waiting_synchronization_state(remove_gate_file=True)
+            st.warning("Process stopped.")
 
-                    with st.spinner(spinner_message):
-                        launch = start_synchronization(
-                            result.sumocfg_file,
-                            map_name=result.map_name,
-                            ensure_carla=ensure_carla,
-                            carla_process=carla_process,
-                            carla_timeout=int(carla_timeout),
-                        )
+    sync_process = st.session_state.traffic_process
+    if sync_process is not None and sync_process.poll() is None:
+        st.info(f"Co-simulation started, PID {sync_process.pid}.")
+    elif sync_process is not None:
+        st.info(f"Last process ended with code {sync_process.returncode}.")
 
-                    st.session_state.traffic_process = launch.sync_process
-                    st.session_state.traffic_process_log = launch.sync_log_file
-                    st.session_state.carla_process = launch.carla_process
-                    st.session_state.carla_process_log = launch.carla_log_file
+    carla_process = st.session_state.carla_process
+    if carla_process is not None and carla_process.poll() is None:
+        st.info(f"CARLA running, PID {carla_process.pid}.")
+    elif carla_server_ready:
+        st.info(
+            f"CARLA server detected on {DEFAULT_CARLA_HOST}:{DEFAULT_CARLA_PORT}."
+        )
+    elif carla_process is not None:
+        st.info(f"Last CARLA process ended with code {carla_process.returncode}.")
 
-                    message = f"Co-simulation started, PID {launch.sync_process.pid}."
-                    if carla_mode == "reuse":
-                        message += (
-                            f" Using CARLA already running on "
-                            f"{DEFAULT_CARLA_HOST}:{DEFAULT_CARLA_PORT}."
-                        )
-                    if launch.map_loaded:
-                        message += f" Town {result.map_name} loaded."
-                    if carla_mode != "reuse":
-                        if launch.carla_started:
-                            message += " CARLA started."
-                    st.success(message)
-                except Exception as exc:
-                    st.error(f"Start failed: {exc}")
-        with run_cols[1]:
-            if st.button("Stop co-simulation", disabled=not sync_running):
-                sync_process.terminate()
-                st.session_state.traffic_process = None
-                st.warning("Process stopped.")
-        with run_cols[2]:
-            if st.button(
-                "Stop CARLA",
-                disabled=not (managed_carla_running or carla_server_ready),
-            ):
-                try:
-                    stopped = stop_carla_server(carla_server_status().get("detected_version"))
-                    st.session_state.carla_process = None
-                    if stopped.get("port_closed"):
-                        st.warning("CARLA stopped.")
-                    else:
-                        st.warning(
-                            "Local CARLA processes were terminated, but port 2000 is still open."
-                        )
-                except Exception as exc:
-                    st.error(f"CARLA stop failed: {exc}")
-
-        sync_process = st.session_state.traffic_process
-        if sync_process is not None and sync_process.poll() is None:
-            st.info(f"Co-simulation started, PID {sync_process.pid}.")
-        elif sync_process is not None:
-            st.info(f"Last process ended with code {sync_process.returncode}.")
-
-        carla_process = st.session_state.carla_process
-        if carla_process is not None and carla_process.poll() is None:
-            st.info(f"CARLA running, PID {carla_process.pid}.")
-        elif carla_server_ready:
-            st.info(
-                f"CARLA server detected on {DEFAULT_CARLA_HOST}:{DEFAULT_CARLA_PORT}."
-            )
-        elif carla_process is not None:
-            st.info(f"Last CARLA process ended with code {carla_process.returncode}.")
-
-        if st.session_state.traffic_process_log:
-            st.caption(f"Co-simulation Log: {st.session_state.traffic_process_log}")
-        if st.session_state.carla_process_log:
-            st.caption(f"CARLA Log: {st.session_state.carla_process_log}")
+    if st.session_state.traffic_process_log:
+        st.caption(f"Co-simulation Log: {st.session_state.traffic_process_log}")
+    if st.session_state.carla_process_log:
+        st.caption(f"CARLA Log: {st.session_state.carla_process_log}")
 
 
 def render_setup():
@@ -2334,33 +2581,72 @@ def render_live_vehicle_editor():
             st.error(f"Live update failed: {response.text}")
 
 
-ego_vtype_enabled = active_carla_version() == "0.9.13"
-section_options = ["🚦 Traffic Scenario", "🗺️ Path Setup", "📊 Monitoring"]
-if ego_vtype_enabled:
-    section_options.insert(2, "🔧 Ego vType")
-elif st.session_state.get("dashboard_section") == "🔧 Ego vType":
-    st.session_state.dashboard_section = "🚦 Traffic Scenario"
+simulation_step = simulation_step_label()
+vehicle_step = vehicle_setup_step_label()
+autoware_workflow = active_carla_version() == "0.9.13"
+if autoware_workflow:
+    section_options = [
+        STEP_CARLA_LABEL,
+        STEP_ROUTES_LABEL,
+        simulation_step,
+        vehicle_step,
+        STEP_MONITORING_LABEL,
+    ]
+    workflow_caption = (
+        "Follow the workflow from left to right: start CARLA, generate SUMO routes, "
+        "configure the run, then launch Autoware and start the co-simulation."
+    )
+else:
+    section_options = [
+        STEP_CARLA_LABEL,
+        STEP_ROUTES_LABEL,
+        vehicle_step,
+        simulation_step,
+        STEP_MONITORING_LABEL,
+    ]
+    workflow_caption = (
+        "Follow the workflow from left to right: start CARLA, generate SUMO routes, "
+        "prepare the vehicle, then run the co-simulation."
+    )
+current_section = st.session_state.get("dashboard_section")
+if current_section not in section_options:
+    mapped_section = None
+    if current_section:
+        current_title = current_section.split(". ", 1)[-1]
+        if "Simulation" in current_title:
+            mapped_section = simulation_step
+        elif "Autoware" in current_title or "SUMO Ego Vehicle" in current_title:
+            mapped_section = vehicle_step
+    st.session_state.dashboard_section = mapped_section or STEP_CARLA_LABEL
+elif current_section is None:
+    st.session_state.dashboard_section = STEP_CARLA_LABEL
 
 section = st.segmented_control(
-    "Sezione dashboard",
+    "Execution steps",
     section_options,
-    default="🚦 Traffic Scenario",
+    default=STEP_CARLA_LABEL,
     key="dashboard_section",
     label_visibility="collapsed",
 )
 
-if not ego_vtype_enabled:
-    st.caption("`🔧 Ego vType` is available only when `CARLA version` is set to `0.9.13`.")
+st.caption(
+    workflow_caption
+)
 
-
-if section == "🚦 Traffic Scenario":
-        preserve_scroll_position("dashboard_traffic_scroll_position")
-        render_traffic_scenario()
-elif section == "🗺️ Path Setup":
-        preserve_scroll_position("dashboard_setup_scroll_position")
-        render_setup()
-elif section == "🔧 Ego vType":
-        preserve_scroll_position("dashboard_ego_vtype_scroll_position")
-        render_autoware_ego_vtype_editor()
+if section == STEP_CARLA_LABEL:
+        preserve_scroll_position("dashboard_carla_step_scroll_position")
+        render_carla_step()
+elif section == STEP_ROUTES_LABEL:
+        preserve_scroll_position("dashboard_routes_step_scroll_position")
+        render_traffic_scenario(show_runner=False)
+elif section == simulation_step:
+        preserve_scroll_position("dashboard_simulation_step_scroll_position")
+        render_simulation_runner()
+elif section == vehicle_step:
+        preserve_scroll_position("dashboard_vehicle_step_scroll_position")
+        if active_carla_version() == "0.9.13":
+            render_autoware_ego_vtype_editor()
+        else:
+            render_setup()
 else:
         render_monitoring()

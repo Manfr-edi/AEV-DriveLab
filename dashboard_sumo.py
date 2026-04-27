@@ -11,11 +11,13 @@ import traci  # pylint: disable=import-error
 
 from sumo_integration.sumo_simulation import SumoActorClass, SumoSimulation
 from sumo_route_tools import (
+    AUTOWARE_EGO_VTYPE,
     DEFAULT_EGO_BLUEPRINT,
     DEFAULT_EGO_BATTERY_CAPACITY,
     ENERGY_ATTRIBUTE_DEFAULTS,
     ENERGY_EMISSION_CLASS,
     ENERGY_PARAM_DEFAULTS,
+    EGO_SUMO_VTYPE,
     MMPEVEM_ATTRIBUTE_DEFAULTS,
     MMPEVEM_EMISSION_CLASS,
     MMPEVEM_PARAM_DEFAULTS,
@@ -47,6 +49,16 @@ COLOR_NAMES = {value: name for name, value in COLOR_VALUES.items()}
 
 class DashboardSumoSimulation(SumoSimulation):
     """SUMO simulation extension used by the dashboard backend."""
+
+    @staticmethod
+    def _is_dashboard_battery_vehicle(veh_id, type_id=None):
+        vehicle_id = str(veh_id)
+        resolved_type_id = "" if type_id is None else str(type_id)
+        return vehicle_id == "ego_vehicle" or vehicle_id.startswith("carla") or resolved_type_id in {
+            EGO_SUMO_VTYPE,
+            DEFAULT_EGO_BLUEPRINT,
+            AUTOWARE_EGO_VTYPE,
+        }
 
     @staticmethod
     def _resolve_vehicle_id(veh_id):
@@ -343,13 +355,18 @@ class DashboardSumoSimulation(SumoSimulation):
             traci.vehicle.getIDList(),
             key=lambda item: (str(item) != "ego_vehicle", str(item)),
         ):
+            type_id = traci.vehicle.getTypeID(veh_id)
             vehicles.append(
                 {
                     "id": str(veh_id),
-                    "type_id": traci.vehicle.getTypeID(veh_id),
+                    "type_id": type_id,
                     "edge": traci.vehicle.getRoadID(veh_id),
                     "speed": traci.vehicle.getSpeed(veh_id),
-                    "has_battery_device": self._has_battery_device(veh_id),
+                    "has_battery_device": (
+                        self._has_battery_device(veh_id)
+                        if self._is_dashboard_battery_vehicle(veh_id, type_id=type_id)
+                        else False
+                    ),
                 }
             )
         return vehicles
@@ -534,30 +551,32 @@ class DashboardSumoSimulation(SumoSimulation):
         if resolved_vehicle_id is None:
             return None
 
+        type_id = traci.vehicle.getTypeID(resolved_vehicle_id)
         battery = None
         battery_failure_threshold = 0.0
-        try:
-            battery = float(
-                traci.vehicle.getParameter(
-                    resolved_vehicle_id,
-                    "device.battery.chargeLevel",
+        if self._is_dashboard_battery_vehicle(resolved_vehicle_id, type_id=type_id):
+            try:
+                battery = float(
+                    traci.vehicle.getParameter(
+                        resolved_vehicle_id,
+                        "device.battery.chargeLevel",
+                    )
                 )
-            )
-        except (TypeError, ValueError, traci.exceptions.TraCIException):
-            pass
-        try:
-            battery_failure_threshold = float(
-                traci.vehicle.getParameter(
-                    resolved_vehicle_id,
-                    "dashboard.battery.failureThreshold",
+            except (TypeError, ValueError, traci.exceptions.TraCIException):
+                pass
+            try:
+                battery_failure_threshold = float(
+                    traci.vehicle.getParameter(
+                        resolved_vehicle_id,
+                        "dashboard.battery.failureThreshold",
+                    )
                 )
-            )
-        except (TypeError, ValueError, traci.exceptions.TraCIException):
-            pass
+            except (TypeError, ValueError, traci.exceptions.TraCIException):
+                pass
 
         return {
             "vehicle_id": str(resolved_vehicle_id),
-            "type_id": traci.vehicle.getTypeID(resolved_vehicle_id),
+            "type_id": type_id,
             "speed": traci.vehicle.getSpeed(resolved_vehicle_id),
             "edge": traci.vehicle.getRoadID(resolved_vehicle_id),
             "battery": battery,

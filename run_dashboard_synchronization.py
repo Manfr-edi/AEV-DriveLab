@@ -118,6 +118,17 @@ def synchronization_loop(args):
             daemon=True,
         ).start()
 
+    if args.wait_start_file:
+        wait_path = Path(args.wait_start_file).expanduser().resolve()
+        logging.info("Waiting for dashboard start signal: %s", wait_path)
+        while not wait_path.exists():
+            time.sleep(0.2)
+        logging.info("Dashboard start signal received.")
+        try:
+            wait_path.unlink()
+        except OSError:
+            pass
+
     try:
         while True:
             start = time.time()
@@ -222,6 +233,12 @@ def build_argparser():
         "--no-dashboard-api",
         action="store_true",
         help="disable the dashboard Flask API",
+    )
+    argparser.add_argument(
+        "--wait-start-file",
+        type=str,
+        default=None,
+        help="wait for this file to appear before advancing the simulation loop",
     )
     argparser.add_argument("--debug", action="store_true", help="enable debug messages")
     return argparser

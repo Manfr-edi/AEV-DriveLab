@@ -104,10 +104,10 @@ This repository is currently tested on:
 
 The minimum setup used to run the project is:
 
-- Ubuntu/Linux
+- Ubuntu/Linux (Tested on 24.04)
 - Python `3.8`
-- Docker and Docker Compose
-- SUMO `1.26`, with `sumo`, `sumo-gui`, `duarouter`, and the SUMO Python tools available
+- Docker and Docker Compose. Follow the installation guide [Here](https://docs.docker.com/engine/install/ubuntu/)
+- SUMO `1.26`, with the SUMO Python tools available. Follow the installation guide [Here](https://sumo.dlr.de/docs/Downloads.php#linux)
 - Python packages from `requirements.txt`
 - at least one CARLA installation under `carla/`
 
@@ -143,9 +143,9 @@ That interpreter must be able to import at least `carla`, `flask`, `lxml`, `trac
 At least one CARLA version is required:
 
 - `CARLA 0.9.13`: use this when you want the Autoware workflow.
-  Download: <https://tiny.carla.org/carla-0-9-13-linux>
+  Download: [Here](https://tiny.carla.org/carla-0-9-13-linux)
 - `CARLA 0.9.15`: use this when you want the ego vehicle managed by SUMO instead of Autoware.
-  Download: <https://tiny.carla.org/carla-0-9-15-linux>
+  Download: [Here](https://tiny.carla.org/carla-0-9-15-linux)
 
 You can install one version only, or both.
 

@@ -2,6 +2,7 @@
 """Flask API used by the Streamlit dashboard during SUMO-CARLA co-simulation."""
 
 import traceback
+import logging
 from flask import Flask, jsonify, request
 
 
@@ -52,7 +53,7 @@ def create_app(sync):
                     str(battery),
                 )
             except Exception as exc:  # pragma: no cover - depends on live TraCI.
-                print("Battery set error:", exc)
+                logging.warning("Battery set error: %s", exc)
 
         try:
             import traci
@@ -63,7 +64,7 @@ def create_app(sync):
                 str(battery_failure_threshold),
             )
         except Exception as exc:  # pragma: no cover - depends on live TraCI.
-            print("Battery threshold set error:", exc)
+            logging.warning("Battery threshold set error: %s", exc)
 
         return {"status": "spawned"}
 
