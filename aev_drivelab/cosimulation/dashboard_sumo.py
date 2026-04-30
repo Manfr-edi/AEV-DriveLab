@@ -10,7 +10,7 @@ import carla  # pylint: disable=import-error
 import traci  # pylint: disable=import-error
 
 from sumo_integration.sumo_simulation import SumoActorClass, SumoSimulation
-from sumo_route_tools import (
+from aev_drivelab.scenario.sumo_route_tools import (
     AUTOWARE_EGO_VTYPE,
     DEFAULT_EGO_BLUEPRINT,
     DEFAULT_EGO_BATTERY_CAPACITY,
@@ -22,6 +22,7 @@ from sumo_route_tools import (
     MMPEVEM_EMISSION_CLASS,
     MMPEVEM_PARAM_DEFAULTS,
     ego_emission_class_value,
+    request_autoware_battery_stop,
 )
 
 
@@ -340,9 +341,48 @@ class DashboardSumoSimulation(SumoSimulation):
     @staticmethod
     def _vehicle_failure_threshold(veh_id):
         try:
-            return traci.vehicle.getParameter(veh_id, "dashboard.battery.failureThreshold")
+            value = traci.vehicle.getParameter(veh_id, "dashboard.battery.failureThreshold")
+            if value not in (None, ""):
+                return value
+        except traci.exceptions.TraCIException:
+            pass
+
+        try:
+            type_id = traci.vehicle.getTypeID(veh_id)
+            return traci.vehicletype.getParameter(type_id, "dashboard.battery.failureThreshold")
         except traci.exceptions.TraCIException:
             return ""
+
+    @staticmethod
+    def _battery_stop_applied(veh_id):
+        try:
+            value = traci.vehicle.getParameter(veh_id, "dashboard.battery.stopApplied")
+            return str(value).strip().lower() in {"1", "true", "yes"}
+        except traci.exceptions.TraCIException:
+            return False
+
+    @staticmethod
+    def _mark_battery_stop_applied(veh_id):
+        try:
+            traci.vehicle.setParameter(veh_id, "dashboard.battery.stopApplied", "true")
+        except traci.exceptions.TraCIException:
+            pass
+
+    @staticmethod
+    def _request_battery_stop(veh_id, type_id=None):
+        resolved_type_id = str(type_id or "")
+        try:
+            traci.vehicle.setSpeed(veh_id, 0)
+        except traci.exceptions.TraCIException as error:
+            logging.warning("Could not stop vehicle %s after battery depletion: %s", veh_id, error)
+
+        if resolved_type_id == AUTOWARE_EGO_VTYPE:
+            try:
+                request_autoware_battery_stop()
+            except Exception as error:  # pragma: no cover - depends on live ROS runtime
+                logging.warning("Could not request Autoware emergency stop for %s: %s", veh_id, error)
+
+        DashboardSumoSimulation._mark_battery_stop_applied(veh_id)
 
     @staticmethod
     def _live_vehicle_type_id(veh_id):
@@ -552,8 +592,40 @@ class DashboardSumoSimulation(SumoSimulation):
             return None
 
         type_id = traci.vehicle.getTypeID(resolved_vehicle_id)
+        route_final_edge = None
+        distance_travelled_m = None
+        distance_remaining_m = None
         battery = None
         battery_failure_threshold = 0.0
+
+        try:
+            distance_travelled_m = float(traci.vehicle.getDistance(resolved_vehicle_id))
+        except (TypeError, ValueError, traci.exceptions.TraCIException):
+            pass
+
+        try:
+            route = traci.vehicle.getRoute(resolved_vehicle_id)
+            route_final_edge = route[-1] if route else None
+        except traci.exceptions.TraCIException:
+            route_final_edge = None
+
+        if route_final_edge:
+            try:
+                target_position = max(0.0, float(self.net.getEdge(route_final_edge).getLength()) - 0.1)
+                distance_remaining_m = float(
+                    traci.vehicle.getDrivingDistance(
+                        resolved_vehicle_id,
+                        route_final_edge,
+                        target_position,
+                    )
+                )
+                if distance_remaining_m < -1e8:
+                    distance_remaining_m = None
+                elif distance_remaining_m is not None:
+                    distance_remaining_m = max(0.0, distance_remaining_m)
+            except (AttributeError, TypeError, ValueError, traci.exceptions.TraCIException):
+                distance_remaining_m = None
+
         if self._is_dashboard_battery_vehicle(resolved_vehicle_id, type_id=type_id):
             try:
                 battery = float(
@@ -566,10 +638,7 @@ class DashboardSumoSimulation(SumoSimulation):
                 pass
             try:
                 battery_failure_threshold = float(
-                    traci.vehicle.getParameter(
-                        resolved_vehicle_id,
-                        "dashboard.battery.failureThreshold",
-                    )
+                    self._vehicle_failure_threshold(resolved_vehicle_id)
                 )
             except (TypeError, ValueError, traci.exceptions.TraCIException):
                 pass
@@ -579,6 +648,10 @@ class DashboardSumoSimulation(SumoSimulation):
             "type_id": type_id,
             "speed": traci.vehicle.getSpeed(resolved_vehicle_id),
             "edge": traci.vehicle.getRoadID(resolved_vehicle_id),
+            "sim_time": traci.simulation.getTime(),
+            "route_final_edge": route_final_edge,
+            "distance_travelled_m": distance_travelled_m,
+            "distance_remaining_m": distance_remaining_m,
             "battery": battery,
             "battery_failure_threshold": battery_failure_threshold,
         }
@@ -586,20 +659,23 @@ class DashboardSumoSimulation(SumoSimulation):
     def tick(self):
         super().tick()
 
-        ego_id = "ego_vehicle"
-        state = self.get_vehicle_state(ego_id)
-        if not state:
-            return
+        for veh_id in traci.vehicle.getIDList():
+            type_id = traci.vehicle.getTypeID(veh_id)
+            if not self._is_dashboard_battery_vehicle(veh_id, type_id=type_id):
+                continue
+            if self._battery_stop_applied(veh_id):
+                continue
 
-        battery = state.get("battery")
-        threshold = float(state.get("battery_failure_threshold") or 0)
-        if battery is None or float(battery) > threshold:
-            return
+            state = self.get_vehicle_state(veh_id)
+            if not state:
+                continue
 
-        try:
-            traci.vehicle.setSpeed(ego_id, 0)
-        except traci.exceptions.TraCIException as error:
-            logging.warning("Could not stop ego vehicle after battery depletion: %s", error)
+            battery = state.get("battery")
+            threshold = float(state.get("battery_failure_threshold") or 0)
+            if threshold <= 0 or battery is None or float(battery) > threshold:
+                continue
+
+            self._request_battery_stop(veh_id, type_id=type_id)
 
 
 def patch_bridge_helper(bridge_helper):

@@ -13,12 +13,12 @@ import sys
 import threading
 import time
 
-PROJECT_ROOT = Path(__file__).resolve().parent
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from sumo_route_tools import (  # pylint: disable=wrong-import-position
+from aev_drivelab.scenario.sumo_route_tools import (  # pylint: disable=wrong-import-position
     DEFAULT_CARLA_VERSION,
     available_carla_versions,
     carla_paths,
@@ -85,8 +85,8 @@ def synchronization_loop(args):
         CarlaSimulation,
         SimulationSynchronization,
     )
-    from dashboard_backend import run_api  # pylint: disable=import-outside-toplevel
-    from dashboard_sumo import (  # pylint: disable=import-outside-toplevel
+    from aev_drivelab.cosimulation.dashboard_backend import run_api  # pylint: disable=import-outside-toplevel
+    from aev_drivelab.cosimulation.dashboard_sumo import (  # pylint: disable=import-outside-toplevel
         DashboardSumoSimulation,
         patch_bridge_helper,
     )

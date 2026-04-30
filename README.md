@@ -1,115 +1,31 @@
 # AEV-DriveLab
 
-Experimental tool for building and running SUMO-CARLA co-simulation scenarios through a Streamlit dashboard. The project starts from the CARLA 0.9.15 SUMO co-simulation scripts and extends them with an interactive control layer for:
+AEV-DriveLab is a Streamlit-based tool for generating and running traffic scenarios that stress the energy consumption of autonomous electric vehicles. It combines SUMO traffic generation with CARLA co-simulation to study how route choice, congestion, traffic density, vehicle type, and battery configuration affect electric-vehicle consumption.
 
-- generating SUMO traffic on an offline map;
-- creating targeted congestion on a selected SUMO edge;
-- starting CARLA, loading the correct Town, and launching SUMO-CARLA synchronization;
-- spawning an ego vehicle with initial battery, start edge, destination edge, and optional routing through a congestion point;
-- monitoring ego vehicle state, speed, current edge, and battery level.
+The tool supports both a SUMO-managed ego vehicle workflow and an Autoware-based autonomous vehicle workflow, while keeping scenario generation, co-simulation launch, vehicle configuration, and monitoring in a single dashboard.
 
-## Main Components
-
-### Streamlit Frontend
-
-The frontend is implemented in `app.py`.
-
-The dashboard has four sections:
-
-- `Path Setup`: select start/end edges for the ego vehicle, including explicit edge direction selection.
-- `Traffic Scenario`: generate SUMO route files for random traffic or edge-based congestion.
-- `Ego vType`: edit the Autoware-specific ego vehicle configuration. This tab is enabled only when the selected CARLA version is `0.9.13`.
-- `Monitoring`: periodically read ego vehicle state from the Flask backend.
-
-Edge selection is based on the offline SUMO map and displays direction information, for example:
-
-```text
-39.0.00 | 720->669 verso est (433,406) -> (571,405)
--39.0.00 | 669->720 verso ovest (571,405) -> (433,406)
-```
-
-This avoids selecting the opposite lane direction when generating congestion or routing the ego vehicle.
-
-### SUMO Scenario Generation
-
-Scenario generation logic is implemented in `sumo_route_tools.py`.
-
-This module:
-
-- reads `*.net.xml` maps from the selected CARLA installation (for example `carla/CARLA_0.9.13`, `carla/CARLA_0.9.15`, or the legacy root-level folders);
-- extracts drivable SUMO edges;
-- computes the nearest edge to a map click;
-- generates `.trips.xml` and `.rou.xml` files;
-- uses SUMO tools such as `duarouter` and `randomTrips.py`;
-- loads available SUMO `vType` entries from the route type files and can assign either a fixed type or a random type per vehicle;
-- creates or updates `custom_<Town>.sumocfg`;
-- starts CARLA, loads the selected Town, and launches `run_dashboard_synchronization.py`.
-
-For congestion scenarios, only the congestion edge is mandatory. Source and destination edges are optional. If they are not provided, random routes are generated while still forcing traffic through the selected congestion edge. After routing, the final route file is filtered so that only vehicles whose route actually contains the congestion edge are kept.
-
-### Simulation Interaction Backend
-
-The dashboard backend is kept outside CARLA's default `run_synchronization.py`.
-
-The custom additions are:
-
-- an internal Flask server exposed on `localhost:5000`;
-- endpoints for ego vehicle spawning, ego state, network data, and nearest-edge lookup;
-- root-level `run_dashboard_synchronization.py`, a dashboard-specific runner that starts the Flask backend in a thread alongside the co-simulation loop;
-- root-level `dashboard_backend.py`, which contains the Flask API;
-- root-level `dashboard_sumo.py`, which contains ego vehicle spawn, ego state, custom vType handling, and CARLA blueprint mapping;
-- support for ego routes with a `via` edge, meaning `start -> via -> end`.
-
-Main endpoints:
-
-```text
-GET  /state
-GET  /network
-GET  /edges
-POST /nearest_edge
-POST /spawn
-```
-
-This keeps the CARLA example runner separate from the dashboard-specific API and ego-vehicle logic.
-
-## Generated Files
-
-The dashboard writes generated scenario files to:
-
-```text
-<carla_install_dir>/Co-Simulation/Sumo/examples/rou/custom_<Town>_traffic.trips.xml
-<carla_install_dir>/Co-Simulation/Sumo/examples/rou/custom_<Town>_traffic.rou.xml
-<carla_install_dir>/Co-Simulation/Sumo/examples/custom_<Town>.sumocfg
-```
-
-Main log files:
-
-```text
-<carla_install_dir>/Co-Simulation/Sumo/examples/output/carla_server.log
-<carla_install_dir>/Co-Simulation/Sumo/examples/output/carla_map.log
-<carla_install_dir>/Co-Simulation/Sumo/examples/output/run_dashboard_synchronization.log
-```
-
-## Tested Environment
+## 🧪 Tested Environment
 
 This repository is currently tested on:
 
 - Ubuntu `24.04`
 - Python `3.8`
-- Docker
-- Docker Compose
+- Docker `29.4.1`
+- Docker Compose `5.1.1`
 - SUMO `1.26`
 
-## Requirements
+## ⚙️ Requirements and Setup
+
+### System Requirements
 
 The minimum setup used to run the project is:
 
-- Ubuntu/Linux (Tested on 24.04)
+- Ubuntu/Linux (tested on Ubuntu `24.04`)
 - Python `3.8`
-- Docker and Docker Compose. Follow the installation guide [Here](https://docs.docker.com/engine/install/ubuntu/)
-- SUMO `1.26`, with the SUMO Python tools available. Follow the installation guide [Here](https://sumo.dlr.de/docs/Downloads.php#linux)
+- Docker and Docker Compose. Follow the installation guide [here](https://docs.docker.com/engine/install/ubuntu/)
+- SUMO `1.26`, with the SUMO Python tools available. Follow the installation guide [here](https://sumo.dlr.de/docs/Downloads.php#linux)
 - Python packages from `requirements.txt`
-- at least one CARLA installation under `carla/`
+- At least one CARLA installation under `carla/`
 
 Install the Python dependencies from the repository root:
 
@@ -117,7 +33,7 @@ Install the Python dependencies from the repository root:
 pip install -r requirements.txt
 ```
 
-If SUMO is installed in the default Ubuntu path, the project should pick it up automatically through `/usr/share/sumo`. If needed, you can still export it explicitly:
+If SUMO is installed in the default Ubuntu path, the project should pick it up automatically through `/usr/share/sumo`. If needed, export it explicitly:
 
 ```bash
 export SUMO_HOME=/usr/share/sumo
@@ -129,7 +45,7 @@ If the CARLA Python API bundled with your CARLA install is not compatible with t
 export CARLA_PYTHON=/path/to/python
 ```
 
-or per version:
+or per CARLA version:
 
 ```bash
 export CARLA_PYTHON_0_9_13=/path/to/python
@@ -138,14 +54,12 @@ export CARLA_PYTHON_0_9_15=/path/to/python
 
 That interpreter must be able to import at least `carla`, `flask`, `lxml`, `traci`, `sumolib`, and `setuptools`.
 
-## CARLA Setup
+### CARLA Setup
 
 At least one CARLA version is required:
 
-- `CARLA 0.9.13`: use this when you want the Autoware workflow.
-  Download: [Here](https://tiny.carla.org/carla-0-9-13-linux)
-- `CARLA 0.9.15`: use this when you want the ego vehicle managed by SUMO instead of Autoware.
-  Download: [Here](https://tiny.carla.org/carla-0-9-15-linux)
+- `CARLA 0.9.13`: use this for the Autoware workflow. Download: [CARLA 0.9.13 Linux](https://tiny.carla.org/carla-0-9-13-linux)
+- `CARLA 0.9.15`: use this for the SUMO-managed ego vehicle workflow. Download: [CARLA 0.9.15 Linux](https://tiny.carla.org/carla-0-9-15-linux)
 
 You can install one version only, or both.
 
@@ -161,31 +75,37 @@ Do not flatten the extracted directories.
 Once at least one CARLA installation is in place, run:
 
 ```bash
-./setup_carla.sh
+./scripts/setup_carla.sh
 ```
 
-The script bootstraps the selected CARLA installation(s), installs the project-specific SUMO/CARLA files, and performs the additional setup needed by this repository.
+The script bootstraps the selected CARLA installation(s), installs the project-specific SUMO/CARLA files, writes the vehicle type files, patches the runtime-critical SUMO integration files, and imports the UT Lexus asset required by the Autoware workflow.
 
-## Autoware Docker Setup
+To bootstrap a specific installation:
 
-If you want to use the Autoware workflow, the `autoware_mini` Docker container must exist and be available.
+```bash
+./scripts/setup_carla.sh carla/CARLA_0.9.15 0.9.15
+```
 
-First build:
+### Autoware Docker Setup
+
+The Autoware workflow requires `CARLA 0.9.13` and an `autoware_mini` Docker container.
+
+First build the container:
 
 ```bash
 cd autoware_mini_docker_compose
 docker compose up --build
 ```
 
-If the image/container is already built, you can simply start it again with:
+If the image/container is already built, start it again with:
 
 ```bash
 docker start autoware_mini
 ```
 
-## Startup
+### Startup
 
-After the CARLA setup is complete, start the dashboard from the repository root:
+After the requirements and CARLA setup are complete, start the dashboard from the repository root:
 
 ```bash
 streamlit run app.py
@@ -203,94 +123,254 @@ Then open the dashboard in the browser, for example:
 http://127.0.0.1:8501
 ```
 
-## Typical Local Startup Sequence
-
-Typical startup sequence on a fresh machine:
+### Typical Local Startup Sequence
 
 1. Install system requirements: Python `3.8`, Docker, Docker Compose, SUMO `1.26`.
 2. Install Python packages with `pip install -r requirements.txt`.
 3. Download and extract `CARLA 0.9.13` and/or `CARLA 0.9.15` into `carla/`.
-4. Run `./setup_carla.sh`.
+4. Run `./scripts/setup_carla.sh`.
 5. If using Autoware, build/start the Docker container from `autoware_mini_docker_compose/`.
 6. Start the dashboard with `streamlit run app.py`.
 
-## Typical Workflow
+## 🚀 Basic Usage
 
-### 1. Generate Traffic or Congestion
+The dashboard is organized as an execution stepper. Each step corresponds to one phase of the experimental workflow.
 
-Open `Traffic Scenario`.
+The available steps depend on the selected CARLA version:
 
-1. Select the offline map, for example `Town04`.
-2. Select `Congestion Edge`.
-3. Click on the map.
-4. Select the correct direction of the clicked edge.
-5. Click `Use as congestion`.
-6. Set vehicle count, spawn interval, and seed.
-7. Select a fixed `SUMO vType`, or enable `Random vType` to assign a random available type to each generated vehicle.
-8. Leave source and destination empty to generate random traffic that passes through the congestion edge, or set them as additional constraints.
-9. Click `Generate route and custom sumocfg`.
+- `CARLA 0.9.15`: `Start CARLA` -> `Generate SUMO Routes` -> `SUMO Ego Vehicle` -> `Run Simulation` -> `Monitoring`
+- `CARLA 0.9.13`: `Start CARLA` -> `Generate SUMO Routes` -> `Configure Simulation` -> `Ego vType / Autoware` -> `Monitoring`
 
-The dashboard creates the route file and the `custom_<Town>.sumocfg` file.
+The workflow below describes the standard autonomous-vehicle experiment: generate traffic, create or select congestion, configure the ego vehicle, run SUMO/CARLA, and monitor energy consumption.
 
-### 2. Start the Co-Simulation
+### 1. Start CARLA
 
-In `Traffic Scenario`, after generating a scenario:
+Use this step to select the active CARLA version and the Town used by the rest of the workflow.
 
-1. Make sure the correct `CARLA version` is selected.
-2. Start CARLA with the top-right dashboard button if needed, or let the scenario start it for you.
-3. Click `Run co-simulation`.
+Main options:
 
-The system runs the following sequence:
+- `CARLA version`: selects the local CARLA installation (`0.9.13` or `0.9.15`).
+- `Selected Town`: fixes the map used for route generation, Autoware launch, and co-simulation.
+- `Run CARLA` / `Kill CARLA`: starts or stops the selected CARLA server.
+- `Load selected Town`: forces the selected Town in a CARLA server that is already running.
 
-```bash
-./CarlaUE4.sh
-python3 PythonAPI/util/config.py --map <Town>
-python3 ../../../run_dashboard_synchronization.py --carla-version <0.9.13|0.9.15> examples/custom_<Town>.sumocfg --sumo-gui
+### 2. Generate SUMO Routes
+
+Use this step to create the traffic scenario. The scenario is generated on the Town selected in step 1.
+
+Scenario modes:
+
+- `Congestion Edge`: generates traffic that crosses a selected SUMO edge. Source and destination edges are optional constraints.
+- `Random Traffic`: generates random routes over the whole network.
+
+Map interaction:
+
+- Click the map to select the nearest SUMO edge.
+- Choose the correct edge direction when both directions are available.
+- Use the selected edge as congestion, source, or destination.
+- Use the invert buttons to switch to the opposite lane direction.
+
+Generation parameters:
+
+- `Vehicles Number`: requested number of traffic vehicles.
+- `Start spawn at t[s]` and `Stop spawn at t[s]`: departure time interval.
+- `Seed`: deterministic random seed.
+- `Spawn distribution`: equidistant, random, or all together for congestion scenarios.
+- `Random vType`: assigns a random SUMO vehicle type to each generated vehicle.
+- `SUMO vType`: uses a fixed vehicle type when random assignment is disabled.
+
+The step writes the route file and the custom SUMO configuration used by the co-simulation.
+
+### 3A. SUMO Ego Vehicle (`CARLA 0.9.15`)
+
+Use this step when the ego vehicle is managed directly through SUMO and the dashboard backend.
+
+Route options:
+
+- Click the network map and assign `START` and `END` edges.
+- Select the explicit edge direction before setting start or end.
+- Invert start/end direction when needed.
+- Reuse the generated congestion scenario for the ego route.
+
+Congestion-aware ego routing:
+
+- `Pass through congested edge`: builds the route as `start -> congestion -> end`.
+- `Use congested edge as start`: uses the congested edge as the ego start.
+- `Use congested edge as destination`: uses the congested edge as the ego destination.
+
+Vehicle options:
+
+- CARLA blueprint associated with the ego vehicle.
+- SUMO emission model: `Energy` or `MMPEVEM`.
+- Maximum battery capacity.
+- Initial battery charge.
+- Critical battery threshold.
+- Detailed SUMO vType attributes and parameters.
+
+Click `Spawn Ego Vehicle` after the co-simulation backend is active.
+
+### 3B. Configure Simulation (`CARLA 0.9.13` / Autoware)
+
+Use this step to arm the SUMO/CARLA bridge before launching Autoware.
+
+Main options:
+
+- `SUMO GUI`: toggles SUMO graphical mode.
+- `Autoware startup wait [s]`: warm-up delay used when SUMO runs headless.
+- `Start simulation`: starts the bridge and waits for Autoware before simulation time advances.
+- `Stop co-simulation`: terminates the bridge process.
+
+In the Autoware workflow, start this step before running Autoware from the ego configuration step.
+
+### 4. Ego vType / Autoware (`CARLA 0.9.13`)
+
+Use this step to configure the Autoware ego vehicle and launch the Autoware stack.
+
+Vehicle options:
+
+- Fixed Autoware CARLA blueprint: `vehicle.lexus.utlexus`.
+- SUMO emission model: `Energy` or `MMPEVEM`.
+- Maximum battery capacity.
+- Current battery charge.
+- Critical battery threshold.
+- Detailed SUMO vType attributes and parameters.
+
+Route options:
+
+- Click the map and choose explicit start/goal edge directions.
+- Reuse the current congestion edge as start or goal.
+- Reuse the SUMO ego start/end selections if available.
+- Invert start/goal direction.
+- Set an Autoware planner speed cap.
+
+Actions:
+
+- `Save ego vType in vtypes.json`: persists the Autoware vehicle type metadata.
+- `Run Autoware`: launches Autoware in the Docker container, publishes the initial pose and goal when both edges are selected, and releases the waiting SUMO/CARLA simulation after the configured warm-up.
+
+### 5. Monitoring
+
+Use this step to monitor the ego vehicle or a CARLA-spawned SUMO vehicle during the experiment.
+
+Available outputs:
+
+- Battery level over time.
+- Energy consumed over time.
+- Vehicle ID, current speed, current SUMO edge, and remaining distance.
+- Events such as battery depletion or destination reached.
+- Persisted monitoring summary after stop, target change, or terminal event.
+
+Main options:
+
+- `Refresh rate (ms)`: polling interval.
+- `Start Monitoring`: clears previous samples and starts a new session.
+- `Stop Monitoring`: stops polling and persists the session summary.
+
+## 🖼️ Suggested Figures
+
+For a tool-paper artifact, the following screenshots are useful when available:
+
+| Figure | Suggested content |
+| --- | --- |
+| `docs/images/01-start-carla.png` | CARLA version and Town selection in the `Start CARLA` step. |
+| `docs/images/02-traffic-scenario.png` | Congestion edge selected on the SUMO network map. |
+| `docs/images/03-ego-route.png` | Ego start/end route with the congested edge highlighted. |
+| `docs/images/04-simulation.png` | Co-simulation process running with SUMO GUI enabled. |
+| `docs/images/05-monitoring.png` | Battery, consumption, speed, edge, and event monitoring. |
+
+## 📁 Generated Files
+
+The dashboard writes generated scenario files to the selected CARLA installation:
+
+```text
+<carla_install_dir>/Co-Simulation/Sumo/examples/rou/custom_<Town>_traffic.trips.xml
+<carla_install_dir>/Co-Simulation/Sumo/examples/rou/custom_<Town>_traffic.rou.xml
+<carla_install_dir>/Co-Simulation/Sumo/examples/custom_<Town>.sumocfg
 ```
 
-Even when a CARLA server is already running, the dashboard still loads the requested Town before launching the SUMO/CARLA synchronization.
+Main log files:
 
-The synchronization command is executed from:
+```text
+<carla_install_dir>/Co-Simulation/Sumo/examples/output/carla_server.log
+<carla_install_dir>/Co-Simulation/Sumo/examples/output/carla_map.log
+<carla_install_dir>/Co-Simulation/Sumo/examples/output/run_dashboard_synchronization.log
+```
+
+Monitoring exports are written under:
+
+```text
+<carla_install_dir>/Co-Simulation/Sumo/examples/output/monitoring/
+```
+
+## 🧩 Implementation Structure
+
+Only the Streamlit entry point remains at repository root:
+
+```text
+app.py
+```
+
+The implementation is organized by functionality:
+
+```text
+aev_drivelab/
+  scenario/
+    sumo_route_tools.py
+  cosimulation/
+    run_dashboard_synchronization.py
+    dashboard_backend.py
+    dashboard_sumo.py
+    backend_bridge.py
+  simulation/
+    config.py
+    ego_controller.py
+    simulation_backend.py
+scripts/
+  setup_carla.sh
+bootstrap_templates/
+  0.9.13/
+  0.9.15/
+  common/
+```
+
+Component responsibilities:
+
+- `app.py`: Streamlit dashboard and workflow stepper.
+- `aev_drivelab/scenario/sumo_route_tools.py`: SUMO edge loading, route generation, CARLA discovery, process launch helpers, vType editing, and Autoware launch helpers.
+- `aev_drivelab/cosimulation/run_dashboard_synchronization.py`: dashboard-specific SUMO/CARLA runner.
+- `aev_drivelab/cosimulation/dashboard_backend.py`: Flask API used by the dashboard during co-simulation.
+- `aev_drivelab/cosimulation/dashboard_sumo.py`: ego vehicle spawning, vehicle state extraction, battery handling, and CARLA blueprint mapping.
+- `aev_drivelab/simulation/`: legacy direct-SUMO helpers kept separate from the dashboard co-simulation path.
+- `scripts/setup_carla.sh`: CARLA bootstrap and project-specific patch installation.
+
+The synchronization command is launched from:
 
 ```text
 <carla_install_dir>/Co-Simulation/Sumo
 ```
 
-### 3. Spawn the Ego Vehicle
-
-Open `Path Setup`.
-
-1. Click on the map.
-2. Select the edge direction.
-3. Click `Set START`.
-4. Repeat for `Set END`.
-5. Set the initial battery.
-6. Click `Spawn Ego Vehicle`.
-
-If a congestion scenario has been generated in `Traffic Scenario`, the following option becomes available:
+and uses the dashboard runner in:
 
 ```text
-Usa il congestionamento generato per la route ego
+<repo_root>/aev_drivelab/cosimulation/run_dashboard_synchronization.py
 ```
 
-Available modes:
+Main dashboard API endpoints exposed on `localhost:5000` during co-simulation:
 
-- `Passa per edge congestionato`: the ego route is built as `start -> congestion edge -> end`.
-- `Usa edge congestionato come destinazione`: the congestion edge becomes the ego vehicle destination.
+```text
+GET  /state
+GET  /network
+GET  /edges
+GET  /events
+POST /nearest_edge
+POST /spawn
+POST /vehicle/<vehicle_id>/vtype
+```
 
-### 4. Monitor the Ego Vehicle
+## 📝 Operational Notes
 
-Open `Monitoring`.
-
-From this section you can:
-
-- start or stop polling;
-- read battery, speed, and current edge;
-- view events such as battery depletion or destination reached.
-
-## Operational Notes
-
-- Do not run multiple instances of `run_dashboard_synchronization.py` using the same Flask port `5000`.
-- CARLA must be ready on port `2000` before loading a map. The dashboard waits for this automatically when `Run co-simulation` is used.
-- Congestion generation relies on SUMO routing. If the network does not allow a valid path through the selected edge, the final number of generated vehicles may be lower than requested.
-- Dashboard-specific backend, SUMO extensions, and launcher live at project root. The CARLA `Co-Simulation/Sumo` folder is used as the runtime working directory but does not contain dashboard code.
+- Do not run multiple instances of the dashboard synchronization runner on the same Flask port `5000`.
+- CARLA must be ready on port `2000` before the selected Town is loaded. The dashboard handles this when CARLA is started from the UI.
+- Congestion generation relies on SUMO routing. If the network does not allow a valid route through the selected edge, the final number of generated vehicles may be lower than requested.
+- The Autoware workflow requires the UT Lexus CARLA asset imported by `scripts/setup_carla.sh`.
+- The dashboard uses the selected CARLA installation to locate maps, route files, SUMO configs, logs, vehicle types, and generated outputs.

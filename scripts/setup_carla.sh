@@ -5,11 +5,13 @@ set -euo pipefail
 UTLEXUS_ASSET_URL="https://github.com/UT-ADL/carla_lexus/releases/download/v0.9.15/utlexus.tar.gz"
 UTLEXUS_ASSET_FILENAME="utlexus.tar.gz"
 UTLEXUS_ASSET_MARKER=".utlexus_asset_imported"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 
 usage() {
     cat <<'EOF'
 Usage:
-  ./setup_carla.sh [<CARLA_DIR> [0.9.13|0.9.15]]
+  ./scripts/setup_carla.sh [<CARLA_DIR> [0.9.13|0.9.15]]
 
 What it does:
   - installs the project-specific SUMO/CARLA files into a vanilla CARLA folder
@@ -331,11 +333,10 @@ bootstrap_carla_dir() {
     local input_dir="$1"
     local requested_version="${2:-}"
 
-    SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
     CARLA_DIR="$(resolve_carla_dir "$input_dir" "$requested_version")"
     VERSION="$(detect_version "$CARLA_DIR" "$requested_version")"
-    TEMPLATE_DIR="$SCRIPT_DIR/bootstrap_templates/$VERSION"
-    COMMON_TEMPLATE_DIR="$SCRIPT_DIR/bootstrap_templates/common"
+    TEMPLATE_DIR="$REPO_ROOT/bootstrap_templates/$VERSION"
+    COMMON_TEMPLATE_DIR="$REPO_ROOT/bootstrap_templates/common"
     TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
     BACKUP_DIR="$CARLA_DIR/.customcosim-backups/$TIMESTAMP"
 
@@ -413,8 +414,6 @@ bootstrap_carla_dir() {
     info "The dashboard will generate custom_Town*.sumocfg on demand."
 }
 
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-
 if [[ $# -ge 1 ]]; then
     case "$1" in
         -h|--help)
@@ -436,10 +435,10 @@ fi
 
 detected_dirs=()
 for candidate_dir in \
-    "$SCRIPT_DIR"/carla/CARLA_0.9.13 \
-    "$SCRIPT_DIR"/carla/CARLA_0.9.15 \
-    "$SCRIPT_DIR"/CARLA_0.9.13 \
-    "$SCRIPT_DIR"/CARLA_0.9.15
+    "$REPO_ROOT"/carla/CARLA_0.9.13 \
+    "$REPO_ROOT"/carla/CARLA_0.9.15 \
+    "$REPO_ROOT"/CARLA_0.9.13 \
+    "$REPO_ROOT"/CARLA_0.9.15
 do
     if is_carla_install_dir "$candidate_dir"; then
         detected_dirs+=("$candidate_dir")
@@ -447,7 +446,7 @@ do
 done
 
 if [[ ${#detected_dirs[@]} -eq 0 ]]; then
-    die "No local CARLA installation found next to setup_carla.sh (expected `carla/CARLA_0.9.13`, `carla/CARLA_0.9.15`, or the legacy root-level directories)."
+    die "No local CARLA installation found under the repository root (expected `carla/CARLA_0.9.13`, `carla/CARLA_0.9.15`, or the legacy root-level directories)."
 fi
 
 for detected_dir in "${detected_dirs[@]}"; do

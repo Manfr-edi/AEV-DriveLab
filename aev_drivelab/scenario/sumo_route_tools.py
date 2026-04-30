@@ -20,7 +20,7 @@ except ImportError:  # pragma: no cover - optional runtime dependency
     psutil = None
 
 
-PROJECT_ROOT = Path(__file__).resolve().parent
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 EGO_SUMO_VTYPE = "ego_vehicle_type"
 SUPPORTED_CARLA_VERSIONS = ("0.9.13", "0.9.15")
 DEFAULT_CARLA_VERSION = "0.9.13"
@@ -613,31 +613,367 @@ def ensure_autoware_blueprint_available(
     )
 
 
+def _configure_autoware_planning_speed_limit_in_container(
+    container_name,
+    planner_speed_limit_kmh,
+):
+    if planner_speed_limit_kmh is None:
+        return None
+
+    docker_binary = shutil.which("docker")
+    speed_limit_value = float(planner_speed_limit_kmh)
+    update_script = """
+import json
+import os
+import re
+from pathlib import Path
+
+path = Path("/opt/catkin_ws/src/autoware_mini/config/planning.yaml")
+speed_limit_value = float(os.environ["AUTOWARE_PLANNER_SPEED_LIMIT_KMH"])
+text = path.read_text()
+updated_text, replacements = re.subn(
+    r"^(speed_limit:\\s*)([0-9.]+)(\\s*(?:#.*)?)$",
+    lambda match: f"{match.group(1)}{speed_limit_value:.3f}{match.group(3)}",
+    text,
+    count=1,
+    flags=re.MULTILINE,
+)
+if replacements != 1:
+    raise RuntimeError("Could not locate 'speed_limit' inside planning.yaml")
+if updated_text != text:
+    path.write_text(updated_text)
+print(json.dumps({
+    "planning_yaml": str(path),
+    "planner_speed_limit_kmh": speed_limit_value,
+    "updated": updated_text != text,
+}))
+""".strip()
+    process = subprocess.run(
+        [
+            docker_binary,
+            "exec",
+            "-e",
+            f"AUTOWARE_PLANNER_SPEED_LIMIT_KMH={speed_limit_value:.3f}",
+            str(container_name),
+            "bash",
+            "-lc",
+            (
+                "source /root/.bashrc && "
+                "source /opt/ros/noetic/setup.bash && "
+                "source /opt/catkin_ws/devel/setup.bash && "
+                f"python3 -c {shlex.quote(update_script)}"
+            ),
+        ],
+        env=_docker_exec_env(),
+        capture_output=True,
+        text=True,
+    )
+    if process.returncode != 0:
+        details = " | ".join(
+            part
+            for part in (process.stderr.strip(), process.stdout.strip())
+            if part
+        )
+        raise RuntimeError(
+            "Could not configure the Autoware planner speed limit inside the container: "
+            f"{details or 'unknown error'}"
+        )
+
+    try:
+        return json.loads(process.stdout.strip().splitlines()[-1])
+    except (IndexError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            "Autoware planner speed-limit setup completed but returned an invalid payload."
+        ) from exc
+
+
+def _publish_autoware_route_in_container(
+    container_name,
+    initial_pose,
+    goal_pose,
+    planner_speed_limit_kmh=None,
+    ros_timeout_seconds=75,
+):
+    docker_binary = shutil.which("docker")
+    payload = json.dumps(
+        {
+            "initial_pose": initial_pose,
+            "goal_pose": goal_pose,
+            "planner_speed_limit_kmh": planner_speed_limit_kmh,
+        },
+        separators=(",", ":"),
+    )
+    publisher_script = """
+import json
+import os
+import time
+
+import rospy
+from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped
+from nav_msgs.msg import Odometry
+
+
+def build_initial_pose_message(data):
+    message = PoseWithCovarianceStamped()
+    message.header.frame_id = data.get("frame_id", "map")
+    message.pose.pose.position.x = float(data["x"])
+    message.pose.pose.position.y = float(data["y"])
+    message.pose.pose.position.z = float(data.get("z", 0.0))
+    message.pose.pose.orientation.x = float(data["qx"])
+    message.pose.pose.orientation.y = float(data["qy"])
+    message.pose.pose.orientation.z = float(data["qz"])
+    message.pose.pose.orientation.w = float(data["qw"])
+    return message
+
+
+def build_goal_message(data):
+    message = PoseStamped()
+    message.header.frame_id = data.get("frame_id", "map")
+    message.pose.position.x = float(data["x"])
+    message.pose.position.y = float(data["y"])
+    message.pose.position.z = float(data.get("z", 0.0))
+    message.pose.orientation.x = float(data["qx"])
+    message.pose.orientation.y = float(data["qy"])
+    message.pose.orientation.z = float(data["qz"])
+    message.pose.orientation.w = float(data["qw"])
+    return message
+
+
+def wait_for_connections(publisher, label, timeout_seconds):
+    deadline = time.time() + timeout_seconds
+    while publisher.get_num_connections() <= 0 and time.time() < deadline and not rospy.is_shutdown():
+        time.sleep(0.2)
+    if publisher.get_num_connections() <= 0:
+        raise RuntimeError(f"Timed out waiting for ROS subscribers on {label}")
+
+
+payload = json.loads(os.environ["AUTOWARE_ROUTE_PAYLOAD"])
+timeout_seconds = float(os.environ.get("AUTOWARE_ROUTE_TIMEOUT_SECONDS", "75"))
+initial_pose = payload["initial_pose"]
+goal_pose = payload["goal_pose"]
+planner_speed_limit_kmh = payload.get("planner_speed_limit_kmh")
+
+rospy.init_node("dashboard_autoware_route_publisher", anonymous=True, disable_signals=True)
+if planner_speed_limit_kmh is not None:
+    rospy.set_param("/planning/speed_limit", float(planner_speed_limit_kmh))
+rospy.wait_for_message("/carla/ego_vehicle/odometry", Odometry, timeout=timeout_seconds)
+
+initial_publisher = rospy.Publisher("/initialpose", PoseWithCovarianceStamped, queue_size=1)
+goal_publisher = rospy.Publisher("/move_base_simple/goal", PoseStamped, queue_size=1)
+
+wait_for_connections(initial_publisher, "/initialpose", timeout_seconds)
+initial_message = build_initial_pose_message(initial_pose)
+for _ in range(12):
+    initial_message.header.stamp = rospy.Time.now()
+    initial_publisher.publish(initial_message)
+    time.sleep(0.2)
+
+time.sleep(1.0)
+
+wait_for_connections(goal_publisher, "/move_base_simple/goal", timeout_seconds)
+goal_message = build_goal_message(goal_pose)
+for _ in range(12):
+    goal_message.header.stamp = rospy.Time.now()
+    goal_publisher.publish(goal_message)
+    time.sleep(0.2)
+
+print(json.dumps({
+    "initial_frame": initial_message.header.frame_id,
+    "goal_frame": goal_message.header.frame_id,
+    "initial_xy": [initial_message.pose.pose.position.x, initial_message.pose.pose.position.y],
+    "goal_xy": [goal_message.pose.position.x, goal_message.pose.position.y],
+    "planner_speed_limit_kmh": planner_speed_limit_kmh
+}))
+""".strip()
+    process = subprocess.run(
+        [
+            docker_binary,
+            "exec",
+            "-e",
+            f"AUTOWARE_ROUTE_PAYLOAD={payload}",
+            "-e",
+            f"AUTOWARE_ROUTE_TIMEOUT_SECONDS={int(ros_timeout_seconds)}",
+            str(container_name),
+            "bash",
+            "-lc",
+            (
+                "source /root/.bashrc && "
+                "source /opt/ros/noetic/setup.bash && "
+                "source /opt/catkin_ws/devel/setup.bash && "
+                f"python3 -c {shlex.quote(publisher_script)}"
+            ),
+        ],
+        env=_docker_exec_env(),
+        capture_output=True,
+        text=True,
+    )
+    if process.returncode != 0:
+        details = " | ".join(
+            part
+            for part in (process.stderr.strip(), process.stdout.strip())
+            if part
+        )
+        raise RuntimeError(
+            "Could not publish the Autoware initial pose and goal via ROS 1: "
+            f"{details or 'unknown error'}"
+        )
+
+    try:
+        return json.loads(process.stdout.strip().splitlines()[-1])
+    except (IndexError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            "Autoware route publication completed but returned an invalid ROS payload."
+        ) from exc
+
+
+def request_autoware_battery_stop(
+    name_filter=DEFAULT_AUTOWARE_DOCKER_FILTER,
+    ros_timeout_seconds=15,
+):
+    container = find_running_autoware_container(name_filter=name_filter)
+    container_name = container.get("Names") or container.get("ID")
+    docker_binary = shutil.which("docker")
+    stop_script = """
+import json
+import time
+
+import rospy
+from ackermann_msgs.msg import AckermannDrive
+from std_msgs.msg import Float64
+from std_srvs.srv import Empty
+
+
+rospy.init_node("dashboard_autoware_battery_stop", anonymous=True, disable_signals=True)
+service_called = False
+service_error = None
+
+try:
+    rospy.wait_for_service("/planning/cancel_route", timeout=float(__import__("os").environ.get("AUTOWARE_STOP_TIMEOUT_SECONDS", "15")))
+    cancel_route = rospy.ServiceProxy("/planning/cancel_route", Empty)
+    cancel_route()
+    service_called = True
+except Exception as exc:
+    service_error = str(exc)
+
+ackermann_pub = rospy.Publisher("/carla/ego_vehicle/ackermann_cmd", AckermannDrive, queue_size=1)
+target_speed_pub = rospy.Publisher("/carla/ego_vehicle/target_speed", Float64, queue_size=1)
+time.sleep(0.5)
+
+stop_cmd = AckermannDrive()
+stop_cmd.speed = 0.0
+stop_cmd.acceleration = -5.0
+for _ in range(10):
+    ackermann_pub.publish(stop_cmd)
+    target_speed_pub.publish(Float64(0.0))
+    time.sleep(0.1)
+
+print(json.dumps({
+    "container_name": __import__("os").environ.get("AUTOWARE_STOP_CONTAINER"),
+    "service_called": service_called,
+    "service_error": service_error,
+}))
+""".strip()
+    process = subprocess.run(
+        [
+            docker_binary,
+            "exec",
+            "-e",
+            f"AUTOWARE_STOP_TIMEOUT_SECONDS={int(ros_timeout_seconds)}",
+            "-e",
+            f"AUTOWARE_STOP_CONTAINER={container_name}",
+            str(container_name),
+            "bash",
+            "-lc",
+            (
+                "source /root/.bashrc && "
+                "source /opt/ros/noetic/setup.bash && "
+                "source /opt/catkin_ws/devel/setup.bash && "
+                f"python3 -c {shlex.quote(stop_script)}"
+            ),
+        ],
+        env=_docker_exec_env(),
+        capture_output=True,
+        text=True,
+    )
+    if process.returncode != 0:
+        details = " | ".join(
+            part
+            for part in (process.stderr.strip(), process.stdout.strip())
+            if part
+        )
+        raise RuntimeError(
+            "Could not request the Autoware emergency stop via ROS 1: "
+            f"{details or 'unknown error'}"
+        )
+
+    try:
+        return json.loads(process.stdout.strip().splitlines()[-1])
+    except (IndexError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            "Autoware battery-stop request completed but returned an invalid payload."
+        ) from exc
+
+
 def launch_autoware_carla_in_container(
     map_name,
     name_filter=DEFAULT_AUTOWARE_DOCKER_FILTER,
     spawn_edge=None,
+    start_edge=None,
+    goal_edge=None,
+    speed_limit_kmh=None,
 ):
     map_name = str(map_name).strip()
     if not map_name:
         raise ValueError("A valid map name is required to start Autoware.")
 
-    # Temporarily disabled: overriding Autoware spawn from a SUMO edge was causing
-    # unreliable launches. Keep the parameter for compatibility, but ignore it.
     _ = spawn_edge
+
+    start_edge = (str(start_edge).strip() if start_edge is not None else "")
+    goal_edge = (str(goal_edge).strip() if goal_edge is not None else "")
+    route_requested = bool(start_edge or goal_edge)
+    if route_requested and (not start_edge or not goal_edge):
+        raise ValueError(
+            "Both a start edge and a goal edge are required for the Autoware edge-based launch."
+        )
+
+    initial_pose = None
+    goal_pose = None
+    if route_requested:
+        initial_pose = autoware_pose_from_edge(
+            start_edge,
+            map_name=map_name,
+            pose_role="initial",
+            edge_position="start",
+        )
+        goal_pose = autoware_pose_from_edge(
+            goal_edge,
+            map_name=map_name,
+            pose_role="goal",
+            edge_position="end",
+        )
 
     container = find_running_autoware_container(name_filter=name_filter)
     x11_setup = _prepare_autoware_x11_access()
     container_name = container.get("Names") or container.get("ID")
     docker_binary = shutil.which("docker")
     ensure_autoware_blueprint_available(container_name)
+    speed_limit_value = None
+    planner_speed_limit_setup = None
+    if speed_limit_kmh is not None:
+        speed_limit_value = float(speed_limit_kmh)
+        planner_speed_limit_setup = _configure_autoware_planning_speed_limit_in_container(
+            container_name,
+            speed_limit_value,
+        )
     command = (
         "source /root/.bashrc && "
         "source /opt/ros/noetic/setup.bash && "
         "source /opt/catkin_ws/devel/setup.bash && "
-        f"exec roslaunch autoware_mini start_carla.launch "
+        + f"exec roslaunch autoware_mini start_carla.launch "
         f"map_name:={shlex.quote(map_name)} generate_traffic:=false"
     )
+    if route_requested:
+        command += " load_goals:=false"
     process = subprocess.run(
         [
             docker_binary,
@@ -666,6 +1002,19 @@ def launch_autoware_carla_in_container(
             f"{process.stderr.strip() or process.stdout.strip()}"
         )
 
+    route_publication = None
+    route_publication_error = None
+    if route_requested:
+        try:
+            route_publication = _publish_autoware_route_in_container(
+                container_name,
+                initial_pose["pose"],
+                goal_pose["pose"],
+                planner_speed_limit_kmh=speed_limit_kmh,
+            )
+        except Exception as exc:  # pragma: no cover - depends on live ROS runtime
+            route_publication_error = str(exc)
+
     return {
         "container_name": str(container_name),
         "container_image": str(container.get("Image", "")),
@@ -674,9 +1023,31 @@ def launch_autoware_carla_in_container(
         "command": command,
         "spawn_edge": None,
         "spawn_point": None,
-        "carla_map": None,
-        "spawn_projection_mode": None,
-        "spawn_projection_error": None,
+        "carla_map": (
+            initial_pose.get("carla_map")
+            if initial_pose is not None
+            else None
+        ),
+        "spawn_projection_mode": (
+            initial_pose.get("projection_mode")
+            if initial_pose is not None
+            else None
+        ),
+        "spawn_projection_error": (
+            initial_pose.get("projection_error")
+            if initial_pose is not None
+            else None
+        ),
+        "start_edge": start_edge or None,
+        "goal_edge": goal_edge or None,
+        "planner_speed_limit_kmh": (
+            speed_limit_value
+        ),
+        "planner_speed_limit_setup": planner_speed_limit_setup,
+        "initial_pose": initial_pose,
+        "goal_pose": goal_pose,
+        "route_publication": route_publication,
+        "route_publication_error": route_publication_error,
     }
 
 
@@ -950,6 +1321,7 @@ def read_autoware_ego_vtype_config():
         "emission_model": ENERGY_EMISSION_CLASS,
         "battery_capacity": DEFAULT_EGO_BATTERY_CAPACITY,
         "battery_charge_level": min(5000.0, DEFAULT_EGO_BATTERY_CAPACITY),
+        "battery_failure_threshold": 0.0,
         "attributes": dict(ENERGY_ATTRIBUTE_DEFAULTS),
         "parameters": dict(ENERGY_PARAM_DEFAULTS),
     }
@@ -987,6 +1359,7 @@ def read_autoware_ego_vtype_config():
                 "carla.blueprint",
                 "device.battery.capacity",
                 "device.battery.chargeLevel",
+                "dashboard.battery.failureThreshold",
             }
         }
     )
@@ -1006,11 +1379,20 @@ def read_autoware_ego_vtype_config():
         battery_charge_level = min(5000.0, battery_capacity)
     battery_charge_level = min(max(0.0, battery_charge_level), battery_capacity)
 
+    try:
+        battery_failure_threshold = float(
+            params.get("dashboard.battery.failureThreshold", 0.0)
+        )
+    except ValueError:
+        battery_failure_threshold = 0.0
+    battery_failure_threshold = min(max(0.0, battery_failure_threshold), battery_capacity)
+
     config.update(
         {
             "emission_model": emission_model,
             "battery_capacity": battery_capacity,
             "battery_charge_level": battery_charge_level,
+            "battery_failure_threshold": battery_failure_threshold,
             "attributes": attributes,
             "parameters": default_params,
         }
@@ -1205,7 +1587,7 @@ def read_sumo_edges(map_name=DEFAULT_MAP):
         if not road_lanes:
             continue
 
-        shape = _parse_shape(edge.get("shape")) or _parse_shape(road_lanes[0].get("shape"))
+        shape = _parse_shape(road_lanes[0].get("shape")) or _parse_shape(edge.get("shape"))
         if len(shape) < 2:
             continue
 
@@ -1225,7 +1607,7 @@ def read_sumo_edges(map_name=DEFAULT_MAP):
 
 
 def edge_label(edge):
-    suffix = "corsia" if edge.lane_count == 1 else "corsie"
+    suffix = "lane" if edge.lane_count == 1 else "lanes"
     direction = edge_direction_label(edge)
     return (
         f"{edge.edge_id} | {direction} "
@@ -1243,13 +1625,13 @@ def edge_direction_label(edge):
     dy = end[1] - start[1]
 
     if abs(dx) >= abs(dy):
-        cardinal = "est" if dx >= 0 else "ovest"
+        cardinal = "east" if dx >= 0 else "west"
     else:
-        cardinal = "nord" if dy >= 0 else "sud"
+        cardinal = "north" if dy >= 0 else "south"
 
     nodes = f"{edge.from_node}->{edge.to_node}" if edge.from_node and edge.to_node else ""
     coords = f"({start[0]:.0f},{start[1]:.0f}) -> ({end[0]:.0f},{end[1]:.0f})"
-    return f"{nodes} verso {cardinal} {coords}".strip()
+    return f"{nodes} toward {cardinal} {coords}".strip()
 
 
 def opposite_edge_id(edge_id, edge_ids):
@@ -1303,10 +1685,167 @@ def _point_along_shape(shape, distance_from_start):
     )
 
 
+def _shape_length(shape):
+    total_length = 0.0
+    for start, end in zip(shape, shape[1:]):
+        total_length += math.hypot(end[0] - start[0], end[1] - start[1])
+    return total_length
+
+
 def _sumo_heading_from_vector(dx, dy):
     if abs(dx) <= 1e-6 and abs(dy) <= 1e-6:
         raise ValueError("Could not determine a valid heading from the selected edge.")
     return (90.0 - math.degrees(math.atan2(dy, dx))) % 360.0
+
+
+def _autoware_map_xy_from_sumo_point(map_name, sumo_x, sumo_y):
+    offset_x, offset_y = _net_location_offset(map_name)
+    return sumo_x - offset_x, sumo_y - offset_y
+
+
+def _carla_xy_from_sumo_point(map_name, sumo_x, sumo_y):
+    map_x, map_y = _autoware_map_xy_from_sumo_point(map_name, sumo_x, sumo_y)
+    return map_x, -map_y
+
+
+def _fallback_autoware_pose_from_edge(edge, map_name, edge_position="start", z_value=0.0):
+    reference_shape = edge.shape
+    reference_length = _shape_length(reference_shape)
+    probe_distance = min(max(reference_length * 0.02, 1.0), 4.0)
+    if reference_length <= probe_distance * 2.0:
+        sample_distance = max(reference_length * 0.25, 0.0)
+    elif edge_position == "end":
+        sample_distance = max(reference_length - probe_distance, 0.0)
+    else:
+        sample_distance = probe_distance
+
+    sample_x, sample_y, dx, dy = _point_along_shape(reference_shape, sample_distance)
+    fallback_yaw = math.degrees(math.atan2(dy, dx))
+    map_x, map_y = _autoware_map_xy_from_sumo_point(map_name, sample_x, sample_y)
+
+    pose = {
+        "frame_id": "map",
+        "x": round(map_x, 3),
+        "y": round(map_y, 3),
+        "z": float(z_value),
+        "roll": 0.0,
+        "pitch": 0.0,
+        "yaw": round(fallback_yaw, 3),
+    }
+    pose.update(_quaternion_from_euler_deg(0.0, 0.0, fallback_yaw))
+    return pose
+
+
+def _quaternion_from_euler_deg(roll_deg, pitch_deg, yaw_deg):
+    roll = math.radians(float(roll_deg))
+    pitch = math.radians(float(pitch_deg))
+    yaw = math.radians(float(yaw_deg))
+
+    half_roll = roll * 0.5
+    half_pitch = pitch * 0.5
+    half_yaw = yaw * 0.5
+
+    cr = math.cos(half_roll)
+    sr = math.sin(half_roll)
+    cp = math.cos(half_pitch)
+    sp = math.sin(half_pitch)
+    cy = math.cos(half_yaw)
+    sy = math.sin(half_yaw)
+
+    return {
+        "qx": sr * cp * cy - cr * sp * sy,
+        "qy": cr * sp * cy + sr * cp * sy,
+        "qz": cr * cp * sy - sr * sp * cy,
+        "qw": cr * cp * cy + sr * sp * sy,
+    }
+
+
+def _carla_waypoint_transform(carla_x, carla_y, host=DEFAULT_CARLA_HOST, port=DEFAULT_CARLA_PORT):
+    query_script = (
+        "import warnings; "
+        "warnings.filterwarnings('ignore', message='pkg_resources is deprecated as an API.*'); "
+        "import carla, json; "
+        f"client = carla.Client({host!r}, {int(port)}); "
+        "client.set_timeout(5.0); "
+        "world = client.get_world(); "
+        f"location = carla.Location(x={carla_x!r}, y={carla_y!r}, z=10.0); "
+        "waypoint = world.get_map().get_waypoint("
+        "location, project_to_road=True, lane_type=carla.LaneType.Driving"
+        "); "
+        "assert waypoint is not None, 'no driving waypoint found'; "
+        "transform = waypoint.transform; "
+        "print(json.dumps({"
+        "'world_map': world.get_map().name, "
+        "'x': transform.location.x, "
+        "'y': transform.location.y, "
+        "'z': transform.location.z, "
+        "'roll': transform.rotation.roll, "
+        "'pitch': transform.rotation.pitch, "
+        "'yaw': transform.rotation.yaw"
+        "}))"
+    )
+
+    python_executable = resolve_carla_python_executable()
+    process = subprocess.run(
+        [
+            str(python_executable),
+            "-c",
+            query_script,
+        ],
+        env=_build_env(),
+        capture_output=True,
+        text=True,
+    )
+    if process.returncode != 0:
+        details = " | ".join(
+            part
+            for part in (process.stderr.strip(), process.stdout.strip())
+            if part
+        )
+        raise RuntimeError(details or "Could not contact CARLA for waypoint projection.")
+
+    try:
+        return json.loads(process.stdout.strip().splitlines()[-1])
+    except (IndexError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            "Autoware pose generation returned an invalid CARLA waypoint payload."
+        ) from exc
+
+
+def autoware_pose_from_edge(
+    edge_id,
+    map_name=DEFAULT_MAP,
+    host=DEFAULT_CARLA_HOST,
+    port=DEFAULT_CARLA_PORT,
+    pose_role="goal",
+    edge_position="start",
+):
+    edge_id = str(edge_id).strip()
+    if not edge_id:
+        raise ValueError("A valid SUMO edge is required to build an Autoware pose.")
+
+    edge = next(
+        (candidate for candidate in read_sumo_edges(map_name) if candidate.edge_id == edge_id),
+        None,
+    )
+    if edge is None:
+        raise ValueError(f"SUMO edge '{edge_id}' is not present in map '{map_name}'.")
+
+    fallback_pose = _fallback_autoware_pose_from_edge(
+        edge,
+        map_name,
+        edge_position=edge_position,
+        z_value=0.0,
+    )
+
+    return {
+        "edge_id": edge.edge_id,
+        "pose_role": str(pose_role),
+        "carla_map": str(map_name),
+        "pose": fallback_pose,
+        "projection_mode": "sumo_map_frame",
+        "projection_error": None,
+    }
 
 
 def autoware_spawn_point_from_edge(
@@ -1326,88 +1865,40 @@ def autoware_spawn_point_from_edge(
     if edge is None:
         raise ValueError(f"SUMO edge '{edge_id}' is not present in map '{map_name}'.")
 
-    sample_distance = min(max(edge.length * 0.1, 3.0), 12.0)
-    sample_x, sample_y, dx, dy = _point_along_shape(edge.shape, sample_distance)
-    sumo_heading = _sumo_heading_from_vector(dx, dy)
-    fallback_yaw = sumo_heading - 90.0
-    offset_x, offset_y = _net_location_offset(map_name)
-    carla_x = sample_x - offset_x
-    carla_y = -(sample_y - offset_y)
-    fallback_spawn_point = (
-        f"{carla_x:.3f},{carla_y:.3f},0.500,0.000,0.000,{fallback_yaw:.3f}"
+    pose_data = autoware_pose_from_edge(
+        edge_id,
+        map_name=map_name,
+        host=host,
+        port=port,
+        pose_role="spawn",
+        edge_position="start",
     )
-
-    query_script = (
-        "import warnings; "
-        "warnings.filterwarnings('ignore', message='pkg_resources is deprecated as an API.*'); "
-        "import carla, json; "
-        f"client = carla.Client({host!r}, {int(port)}); "
-        "client.set_timeout(5.0); "
-        "world = client.get_world(); "
-        f"location = carla.Location(x={carla_x!r}, y={carla_y!r}, z=10.0); "
-        "waypoint = world.get_map().get_waypoint("
-        "location, project_to_road=True, lane_type=carla.LaneType.Driving"
-        "); "
-        "assert waypoint is not None, 'no driving waypoint found'; "
-        "transform = waypoint.transform; "
-        "print(json.dumps({"
-        "'world_map': world.get_map().name, "
-        "'x': transform.location.x, "
-        "'y': transform.location.y, "
-        "'z': transform.location.z + 0.5, "
-        "'roll': transform.rotation.roll, "
-        "'pitch': transform.rotation.pitch, "
-        "'yaw': transform.rotation.yaw"
-        "}))"
+    pose = pose_data["pose"]
+    spawn_point = ",".join(
+        f"{float(pose[key]):.3f}"
+        for key in ("x", "y", "z", "roll", "pitch", "yaw")
     )
-
-    python_executable = resolve_carla_python_executable()
-    try:
-        process = subprocess.run(
-            [
-                str(python_executable),
-                "-c",
-                query_script,
-            ],
-            env=_build_env(),
-            capture_output=True,
-            text=True,
-        )
-    except OSError as exc:
-        details = str(exc)
+    fallback_pose_values = _fallback_autoware_pose_from_edge(
+        edge,
+        map_name,
+        edge_position="start",
+        z_value=0.5,
+    )
+    if pose_data["projection_mode"] == "sumo_fallback":
+        fallback_spawn_point = spawn_point
     else:
-        if process.returncode == 0:
-            try:
-                waypoint_data = json.loads(process.stdout.strip().splitlines()[-1])
-            except (IndexError, json.JSONDecodeError):
-                details = "Autoware spawn point generation returned an invalid CARLA waypoint payload."
-            else:
-                spawn_point = ",".join(
-                    f"{float(waypoint_data[key]):.3f}"
-                    for key in ("x", "y", "z", "roll", "pitch", "yaw")
-                )
-                return {
-                    "edge_id": edge.edge_id,
-                    "carla_map": str(waypoint_data.get("world_map", "")),
-                    "spawn_point": spawn_point,
-                    "fallback_spawn_point": fallback_spawn_point,
-                    "projection_mode": "nearest_waypoint",
-                    "projection_error": None,
-                }
-        else:
-            details = " | ".join(
-                part
-                for part in (process.stderr.strip(), process.stdout.strip())
-                if part
-            )
+        fallback_spawn_point = ",".join(
+            f"{float(fallback_pose_values[key]):.3f}"
+            for key in ("x", "y", "z", "roll", "pitch", "yaw")
+        )
 
     return {
         "edge_id": edge.edge_id,
-        "carla_map": str(map_name),
-        "spawn_point": fallback_spawn_point,
+        "carla_map": str(pose_data.get("carla_map", map_name)),
+        "spawn_point": spawn_point,
         "fallback_spawn_point": fallback_spawn_point,
-        "projection_mode": "sumo_fallback",
-        "projection_error": details or "Could not contact CARLA for waypoint projection.",
+        "projection_mode": pose_data.get("projection_mode"),
+        "projection_error": pose_data.get("projection_error"),
     }
 
 
@@ -1943,7 +2434,7 @@ def build_run_command(sumocfg_file, sumo_gui=True, wait_start_file=None):
     python_executable = resolve_carla_python_executable()
     command = [
         str(python_executable),
-        str(PROJECT_ROOT / "run_dashboard_synchronization.py"),
+        str(PROJECT_ROOT / "aev_drivelab" / "cosimulation" / "run_dashboard_synchronization.py"),
         "--carla-version",
         active_carla_version(),
         relative_to_sumo_dir(sumocfg_file),

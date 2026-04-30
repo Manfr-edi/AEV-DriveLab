@@ -4,13 +4,14 @@ import requests
 import pandas as pd
 import folium
 import time
+import json
 import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path
 from streamlit_folium import st_folium
 from urllib.parse import quote
 
-from sumo_route_tools import (
+from aev_drivelab.scenario.sumo_route_tools import (
     AUTOWARE_EGO_VTYPE,
     DEFAULT_CARLA_HOST,
     DEFAULT_CARLA_PORT,
@@ -228,7 +229,7 @@ def preserve_scroll_position(storage_key="dashboard_scroll_position"):
         height=0,
     )
 
-st.title("🚗 EV Digital Twin Dashboard")
+st.title("🚗 AEV - DriveLab")
 
 # =====================================================
 # BACKEND CHECK
@@ -261,6 +262,11 @@ for key, default in {
     "start_edge": None,
     "end_edge": None,
     "battery_data": [],
+    "monitoring_samples": [],
+    "monitoring_summary": None,
+    "monitoring_export_paths": None,
+    "monitoring_session_token": None,
+    "monitoring_saved_session_token": None,
     "monitoring": False,
     "map_ready": False,
     "refresh_rate": 1000,
@@ -318,6 +324,17 @@ for key, default in {
     "autoware_ego_last_emission_model": ENERGY_EMISSION_CLASS,
     "autoware_ego_max_battery_capacity": DEFAULT_EGO_BATTERY_CAPACITY,
     "autoware_ego_initial_battery": min(5000.0, DEFAULT_EGO_BATTERY_CAPACITY),
+    "autoware_battery_failure_threshold": 0.0,
+    "autoware_active_battery_failure_threshold": 0.0,
+    "autoware_start_edge": None,
+    "autoware_goal_edge": None,
+    "autoware_start_edge_selection": "",
+    "autoware_goal_edge_selection": "",
+    "autoware_pending_start_edge_selection": None,
+    "autoware_pending_goal_edge_selection": None,
+    "autoware_last_click": None,
+    "autoware_clicked_direction": "",
+    "autoware_planner_speed_limit_kmh": 50.0,
     "autoware_sync_delay_seconds": 10,
     "autoware_sync_delay_selection": None,
     "autoware_last_launch": None,
@@ -367,6 +384,7 @@ def apply_selected_carla_version():
         st.session_state.ego_config_version = None
         st.session_state.autoware_ego_config_loaded = False
         st.session_state.autoware_ego_config_version = None
+        st.session_state.autoware_active_battery_failure_threshold = 0.0
         st.session_state.live_vehicle_config_loaded_for = None
         st.session_state.live_vehicle_config_version = None
         st.session_state.autoware_last_launch = None
@@ -492,6 +510,255 @@ def extract_state_time(state):
     return None
 
 
+def _coerce_float(value):
+    try:
+        if value is None or value == "":
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_filename_fragment(value):
+    text = str(value or "monitoring").strip()
+    normalized = [
+        char if char.isalnum() or char in {"-", "_", "."} else "_"
+        for char in text
+    ]
+    return "".join(normalized).strip("._") or "monitoring"
+
+
+def monitoring_output_dir():
+    base_dir = current_sumo_dir() or Path(__file__).resolve().parent
+    output_dir = Path(base_dir) / "output" / "monitoring"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    return output_dir
+
+
+def append_monitoring_sample(state):
+    if not state:
+        return
+
+    wall_timestamp = time.time()
+    started_at = st.session_state.monitoring_started_at
+    elapsed_seconds = (
+        max(0.0, wall_timestamp - started_at)
+        if started_at is not None
+        else None
+    )
+
+    sample = {
+        "vehicle_id": state.get("vehicle_id"),
+        "edge": state.get("edge"),
+        "wall_timestamp": wall_timestamp,
+        "wall_time": datetime.fromtimestamp(wall_timestamp).isoformat(timespec="seconds"),
+        "elapsed_seconds": elapsed_seconds,
+        "sim_time": _coerce_float(extract_state_time(state)),
+        "speed_mps": _coerce_float(state.get("speed")),
+        "battery_wh": _coerce_float(state.get("battery")),
+        "distance_travelled_m": _coerce_float(state.get("distance_travelled_m")),
+        "distance_remaining_m": _coerce_float(state.get("distance_remaining_m")),
+        "route_final_edge": state.get("route_final_edge"),
+    }
+
+    samples = st.session_state.monitoring_samples
+    if samples and sample["sim_time"] is not None:
+        last_sim_time = samples[-1].get("sim_time")
+        if last_sim_time is not None and abs(last_sim_time - sample["sim_time"]) < 1e-9:
+            samples[-1] = sample
+            return
+
+    samples.append(sample)
+
+
+def build_monitoring_summary(reason=None):
+    samples = st.session_state.monitoring_samples
+    if not samples:
+        return None
+
+    dataframe = pd.DataFrame(samples)
+    vehicle_id = (
+        dataframe["vehicle_id"].dropna().iloc[-1]
+        if "vehicle_id" in dataframe and not dataframe["vehicle_id"].dropna().empty
+        else st.session_state.monitor_vehicle_selected_id
+    )
+    terminal_event = st.session_state.vehicle_terminal_event or {}
+    terminal_kind = terminal_event.get("kind")
+
+    speed_series = dataframe["speed_mps"].dropna() if "speed_mps" in dataframe else pd.Series(dtype=float)
+    battery_series = dataframe["battery_wh"].dropna() if "battery_wh" in dataframe else pd.Series(dtype=float)
+    travelled_series = (
+        dataframe["distance_travelled_m"].dropna()
+        if "distance_travelled_m" in dataframe
+        else pd.Series(dtype=float)
+    )
+    remaining_series = (
+        dataframe["distance_remaining_m"].dropna()
+        if "distance_remaining_m" in dataframe
+        else pd.Series(dtype=float)
+    )
+
+    distance_travelled_m = float(travelled_series.iloc[-1]) if not travelled_series.empty else None
+    distance_remaining_m = float(remaining_series.iloc[-1]) if not remaining_series.empty else None
+    battery_initial_wh = float(battery_series.iloc[0]) if not battery_series.empty else None
+    battery_final_wh = float(battery_series.iloc[-1]) if not battery_series.empty else None
+    battery_consumed_wh = (
+        battery_initial_wh - battery_final_wh
+        if battery_initial_wh is not None and battery_final_wh is not None
+        else None
+    )
+    average_consumption_wh_per_km = (
+        battery_consumed_wh / (distance_travelled_m / 1000.0)
+        if battery_consumed_wh is not None
+        and distance_travelled_m is not None
+        and distance_travelled_m > 0.0
+        else None
+    )
+
+    speed_min_kmh = float(speed_series.min() * 3.6) if not speed_series.empty else None
+    speed_max_kmh = float(speed_series.max() * 3.6) if not speed_series.empty else None
+    speed_avg_kmh = float(speed_series.mean() * 3.6) if not speed_series.empty else None
+
+    arrived = (
+        terminal_kind == "destination_reached"
+        or (distance_remaining_m is not None and distance_remaining_m <= 1.0)
+    )
+
+    return {
+        "vehicle_id": vehicle_id,
+        "reason": reason or terminal_kind or "stopped",
+        "sample_count": int(len(samples)),
+        "wall_time_started": (
+            datetime.fromtimestamp(st.session_state.monitoring_started_at).isoformat(timespec="seconds")
+            if st.session_state.monitoring_started_at is not None
+            else None
+        ),
+        "wall_time_finished": datetime.now().isoformat(timespec="seconds"),
+        "elapsed_seconds": (
+            float(dataframe["elapsed_seconds"].dropna().iloc[-1])
+            if "elapsed_seconds" in dataframe and not dataframe["elapsed_seconds"].dropna().empty
+            else None
+        ),
+        "sim_time_finished": (
+            float(dataframe["sim_time"].dropna().iloc[-1])
+            if "sim_time" in dataframe and not dataframe["sim_time"].dropna().empty
+            else None
+        ),
+        "terminal_event": terminal_kind,
+        "arrived": bool(arrived),
+        "distance_travelled_m": distance_travelled_m,
+        "distance_remaining_m": 0.0 if arrived else distance_remaining_m,
+        "battery_initial_wh": battery_initial_wh,
+        "battery_final_wh": battery_final_wh,
+        "battery_consumed_wh": battery_consumed_wh,
+        "average_consumption_wh_per_km": average_consumption_wh_per_km,
+        "speed_min_kmh": speed_min_kmh,
+        "speed_max_kmh": speed_max_kmh,
+        "speed_avg_kmh": speed_avg_kmh,
+    }
+
+
+def persist_monitoring_session(reason=None):
+    samples = st.session_state.monitoring_samples
+    session_token = st.session_state.monitoring_session_token
+    if not samples or session_token is None:
+        return None
+    if st.session_state.monitoring_saved_session_token == session_token:
+        return st.session_state.monitoring_summary
+
+    summary = build_monitoring_summary(reason=reason)
+    if summary is None:
+        return None
+
+    dataframe = pd.DataFrame(samples)
+    battery_initial_wh = summary.get("battery_initial_wh")
+    if battery_initial_wh is not None and "battery_wh" in dataframe:
+        dataframe["battery_consumed_wh"] = dataframe["battery_wh"].apply(
+            lambda value: battery_initial_wh - value if pd.notna(value) else None
+        )
+    if "speed_mps" in dataframe:
+        dataframe["speed_kmh"] = dataframe["speed_mps"].apply(
+            lambda value: value * 3.6 if pd.notna(value) else None
+        )
+
+    output_dir = monitoring_output_dir()
+    vehicle_fragment = _safe_filename_fragment(summary.get("vehicle_id"))
+    csv_path = output_dir / f"{session_token}_{vehicle_fragment}_monitoring.csv"
+    json_path = output_dir / f"{session_token}_{vehicle_fragment}_summary.json"
+
+    dataframe.to_csv(csv_path, index=False)
+    json_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+    st.session_state.monitoring_summary = summary
+    st.session_state.monitoring_export_paths = {
+        "csv": str(csv_path),
+        "json": str(json_path),
+    }
+    st.session_state.monitoring_saved_session_token = session_token
+    return summary
+
+
+def render_saved_monitoring_summary():
+    summary = st.session_state.get("monitoring_summary")
+    if not summary:
+        return
+
+    st.write("### Monitoring Summary")
+    summary_cols = st.columns(4)
+    summary_cols[0].metric(
+        "Remaining distance",
+        "0 m" if summary.get("arrived") else (
+            "-"
+            if summary.get("distance_remaining_m") is None
+            else f"{summary['distance_remaining_m']:.1f} m"
+        ),
+    )
+    summary_cols[1].metric(
+        "Avg consumption",
+        "-"
+        if summary.get("average_consumption_wh_per_km") is None
+        else f"{summary['average_consumption_wh_per_km']:.1f} Wh/km",
+    )
+    summary_cols[2].metric(
+        "Battery used",
+        "-"
+        if summary.get("battery_consumed_wh") is None
+        else f"{summary['battery_consumed_wh']:.1f} Wh",
+    )
+    summary_cols[3].metric(
+        "Avg speed",
+        "-"
+        if summary.get("speed_avg_kmh") is None
+        else f"{summary['speed_avg_kmh']:.1f} km/h",
+    )
+
+    speed_cols = st.columns(3)
+    speed_cols[0].metric(
+        "Min speed",
+        "-"
+        if summary.get("speed_min_kmh") is None
+        else f"{summary['speed_min_kmh']:.1f} km/h",
+    )
+    speed_cols[1].metric(
+        "Max speed",
+        "-"
+        if summary.get("speed_max_kmh") is None
+        else f"{summary['speed_max_kmh']:.1f} km/h",
+    )
+    speed_cols[2].metric(
+        "Distance travelled",
+        "-"
+        if summary.get("distance_travelled_m") is None
+        else f"{summary['distance_travelled_m']:.1f} m",
+    )
+
+    export_paths = st.session_state.get("monitoring_export_paths") or {}
+    if export_paths.get("csv"):
+        st.caption(f"Saved CSV: `{export_paths['csv']}`")
+    if export_paths.get("json"):
+        st.caption(f"Saved JSON: `{export_paths['json']}`")
+
+
 def vehicle_setup_step_label():
     if active_carla_version() == "0.9.13":
         return "4. Launch Autoware AV"
@@ -531,7 +798,16 @@ def apply_selected_runtime_map():
         st.session_state.end_edge = None
         st.session_state.last_click = None
         st.session_state.ego_clicked_direction = ""
+        st.session_state.autoware_start_edge = None
+        st.session_state.autoware_goal_edge = None
+        st.session_state.autoware_start_edge_selection = ""
+        st.session_state.autoware_goal_edge_selection = ""
+        st.session_state.autoware_pending_start_edge_selection = None
+        st.session_state.autoware_pending_goal_edge_selection = None
+        st.session_state.autoware_last_click = None
+        st.session_state.autoware_clicked_direction = ""
         st.session_state.autoware_last_launch = None
+        st.session_state.autoware_active_battery_failure_threshold = 0.0
         clear_waiting_synchronization_state(remove_gate_file=True)
 
     st.session_state.applied_runtime_map = selected_map
@@ -565,6 +841,13 @@ def sync_launch_widget_defaults():
         st.session_state.autoware_sync_delay_selection = int(
             st.session_state.autoware_sync_delay_seconds
         )
+
+
+def effective_autoware_startup_wait_seconds(sumo_gui=None):
+    configured_wait = int(st.session_state.autoware_sync_delay_seconds)
+    if sumo_gui is None:
+        sumo_gui = bool(st.session_state.traffic_sumo_gui)
+    return 0 if sumo_gui else configured_wait
 
 
 def autoware_launch_sync_state():
@@ -762,6 +1045,11 @@ def render_carla_step():
 
 def reset_monitoring_trip_state():
     st.session_state.battery_data = []
+    st.session_state.monitoring_samples = []
+    st.session_state.monitoring_summary = None
+    st.session_state.monitoring_export_paths = None
+    st.session_state.monitoring_session_token = None
+    st.session_state.monitoring_saved_session_token = None
     st.session_state.dashboard_events = []
     st.session_state.vehicle_terminal_event = None
     st.session_state.latest_monitoring_state = None
@@ -798,7 +1086,7 @@ def record_dashboard_event(kind, state):
         default_threshold = (
             st.session_state.ego_active_battery_failure_threshold
             if vehicle_id == "ego_vehicle"
-            else 0.0
+            else st.session_state.autoware_active_battery_failure_threshold
         )
         threshold = state.get(
             "battery_failure_threshold",
@@ -842,7 +1130,7 @@ def update_vehicle_events(state):
     default_threshold = (
         st.session_state.ego_active_battery_failure_threshold
         if vehicle_id == "ego_vehicle"
-        else 0.0
+        else st.session_state.autoware_active_battery_failure_threshold
     )
     failure_threshold = float(
         state.get(
@@ -859,7 +1147,17 @@ def update_vehicle_events(state):
     if vehicle_id != "ego_vehicle":
         return
 
-    destination_edge = st.session_state.ego_active_end_edge or st.session_state.end_edge
+    remaining_distance_m = _coerce_float(state.get("distance_remaining_m"))
+    if remaining_distance_m is not None and remaining_distance_m <= 1.0:
+        record_dashboard_event("destination_reached", state)
+        st.session_state.monitoring = False
+        return
+
+    destination_edge = (
+        st.session_state.autoware_goal_edge
+        if st.session_state.autoware_last_launch and st.session_state.autoware_goal_edge
+        else (st.session_state.ego_active_end_edge or st.session_state.end_edge)
+    )
     if destination_edge and edge == destination_edge:
         record_dashboard_event("destination_reached", state)
 
@@ -884,13 +1182,15 @@ def render_monitoring():
     st.subheader("📊 Monitoring")
 
     if not backend_alive:
-        st.warning("First Run `run_dashboard_synchronization.py' from Traffic Scenario tab.")
+        st.warning("Start the co-simulation from the simulation step before monitoring.")
+        render_saved_monitoring_summary()
         return
 
     try:
         live_vehicles = get_live_sumo_vehicles()
     except Exception as exc:
         st.error(f"Could not load vehicles for monitoring: {exc}")
+        render_saved_monitoring_summary()
         return
 
     monitoring_candidates = [
@@ -899,7 +1199,11 @@ def render_monitoring():
         if vehicle.get("id") == "ego_vehicle" or is_carla_spawned_vehicle(vehicle)
     ]
     if not monitoring_candidates:
+        if st.session_state.monitoring:
+            st.session_state.monitoring = False
+            persist_monitoring_session("vehicle_unavailable")
         st.info("No ego or CARLA-spawned SUMO vehicle is currently active.")
+        render_saved_monitoring_summary()
         return
 
     candidate_ids = [vehicle["id"] for vehicle in monitoring_candidates]
@@ -924,6 +1228,7 @@ def render_monitoring():
     st.caption(f"Monitoring target: {candidate_labels[selected_vehicle_id]}")
 
     if st.session_state.monitor_vehicle_loaded_for != selected_vehicle_id:
+        persist_monitoring_session("target_changed")
         reset_monitoring_trip_state()
         st.session_state.monitor_vehicle_loaded_for = selected_vehicle_id
 
@@ -938,17 +1243,20 @@ def render_monitoring():
     col1, col2 = st.columns(2)
 
     with col1:
-        if st.button("Start Monitoring"):
+        if st.button("Start Monitoring", disabled=st.session_state.monitoring):
+            reset_monitoring_trip_state()
             st.session_state.monitoring = True
+            st.session_state.monitoring_session_token = datetime.now().strftime("%Y%m%d_%H%M%S")
             st.session_state.last_monitoring_poll = 0.0
-            if st.session_state.monitoring_started_at is None:
-                st.session_state.monitoring_started_at = time.time()
+            st.session_state.monitoring_started_at = time.time()
 
     with col2:
-        if st.button("Stop Monitoring"):
+        if st.button("Stop Monitoring", disabled=not st.session_state.monitoring):
             st.session_state.monitoring = False
+            persist_monitoring_session("manual_stop")
 
     chart_placeholder = st.empty()
+    consumption_chart_placeholder = st.empty()
     metrics_placeholder = st.empty()
     battery_event_placeholder = st.empty()
     event_placeholder = st.empty()
@@ -978,6 +1286,7 @@ def render_monitoring():
 
                 if battery_val is not None:
                     st.session_state.battery_data.append(battery_val)
+                append_monitoring_sample(res)
                 update_vehicle_events(res)
 
             try:
@@ -990,9 +1299,23 @@ def render_monitoring():
 
             st.session_state.last_monitoring_poll = now
 
+    if st.session_state.monitoring_session_token and not st.session_state.monitoring:
+        terminal_event = st.session_state.vehicle_terminal_event or {}
+        persist_monitoring_session(terminal_event.get("kind") or "stopped")
+
     if st.session_state.battery_data:
         df = pd.DataFrame(st.session_state.battery_data, columns=["battery"])
         chart_placeholder.line_chart(df)
+    if st.session_state.monitoring_samples:
+        monitoring_df = pd.DataFrame(st.session_state.monitoring_samples)
+        if "battery_wh" in monitoring_df and not monitoring_df["battery_wh"].dropna().empty:
+            battery_initial = monitoring_df["battery_wh"].dropna().iloc[0]
+            monitoring_df["battery_consumed_wh"] = monitoring_df["battery_wh"].apply(
+                lambda value: battery_initial - value if pd.notna(value) else None
+            )
+            consumption_chart_placeholder.line_chart(
+                monitoring_df[["battery_consumed_wh"]]
+            )
 
     res = st.session_state.latest_monitoring_state
     if res:
@@ -1001,16 +1324,26 @@ def render_monitoring():
             battery_val = float(raw_battery) if raw_battery is not None else None
         except (TypeError, ValueError):
             battery_val = None
-        speed = res.get("speed", 0)
+        speed = _coerce_float(res.get("speed"))
+        remaining_distance_m = _coerce_float(res.get("distance_remaining_m"))
         edge = res.get("edge", "-")
         vehicle_id = res.get("vehicle_id", selected_vehicle_id)
 
         with metrics_placeholder.container():
-            c1, c2, c3, c4 = st.columns(4)
+            c1, c2, c3, c4, c5 = st.columns(5)
             c1.metric("🚘 Vehicle", vehicle_id)
             c2.metric("🔋 Battery", "-" if battery_val is None else battery_val)
-            c3.metric("🚗 Speed", speed)
+            c3.metric(
+                "🚗 Speed",
+                "-" if speed is None else f"{speed * 3.6:.1f} km/h",
+            )
             c4.metric("🛣️ Edge", edge)
+            c5.metric(
+                "🎯 Remaining",
+                "-"
+                if remaining_distance_m is None
+                else f"{remaining_distance_m:.1f} m",
+            )
 
         if battery_val is not None and battery_val <= 0:
             battery_event_placeholder.error("⚠️ Battery depleted!")
@@ -1026,6 +1359,8 @@ def render_monitoring():
                 render_event(e)
         else:
             st.write("No events yet.")
+
+    render_saved_monitoring_summary()
 
 
 def get_network():
@@ -1151,6 +1486,9 @@ def initialize_autoware_ego_config_state():
 
     config = read_autoware_ego_vtype_config()
     apply_vtype_config_to_state("autoware_ego", config)
+    st.session_state.autoware_battery_failure_threshold = float(
+        config.get("battery_failure_threshold", 0.0) or 0.0
+    )
     st.session_state.autoware_ego_config_loaded = True
     st.session_state.autoware_ego_config_version = current_version
 
@@ -1323,11 +1661,38 @@ def render_autoware_ego_vtype_editor():
     st.caption(
         f"Autoware launch map fixed to `{selected_map_name}` from step 1."
     )
+    autoware_edges = get_offline_edges(selected_map_name)
+    autoware_edge_ids = [edge.edge_id for edge in autoware_edges]
+    autoware_labels = {
+        edge.edge_id: edge_label(edge)
+        for edge in autoware_edges
+    }
+    autoware_edge_options = [""] + autoware_edge_ids
+    if st.session_state.autoware_start_edge not in autoware_edge_ids:
+        st.session_state.autoware_start_edge = (
+            st.session_state.start_edge
+            if st.session_state.start_edge in autoware_edge_ids
+            else None
+        )
+    if st.session_state.autoware_goal_edge not in autoware_edge_ids:
+        st.session_state.autoware_goal_edge = (
+            st.session_state.end_edge
+            if st.session_state.end_edge in autoware_edge_ids
+            else None
+        )
     scenario_result = st.session_state.traffic_generation_result
+    traffic_target_edge = (
+        getattr(scenario_result, "target_edge", "")
+        if scenario_result is not None and getattr(scenario_result, "target_edge", "")
+        else st.session_state.traffic_target_edge
+    )
+    if traffic_target_edge not in autoware_edge_ids:
+        traffic_target_edge = ""
     sync_process = st.session_state.traffic_process
     sync_running = sync_process is not None and sync_process.poll() is None
     sync_waiting_for_autoware = waiting_for_autoware_sync()
-    autoware_delay = int(st.session_state.autoware_sync_delay_seconds)
+    sumo_gui_enabled = bool(st.session_state.traffic_sumo_gui)
+    autoware_delay = effective_autoware_startup_wait_seconds(sumo_gui_enabled)
 
     top_cols = st.columns([2, 1, 1])
     with top_cols[0]:
@@ -1356,22 +1721,237 @@ def render_autoware_ego_vtype_editor():
     if st.session_state.autoware_ego_initial_battery > battery_capacity:
         st.session_state.autoware_ego_initial_battery = battery_capacity
 
-    battery_charge_level = st.slider(
-        "Current battery charge [Wh]",
-        min_value=0.0,
-        max_value=float(battery_capacity),
-        step=max(1.0, float(battery_capacity) / 100.0),
-        key="autoware_ego_initial_battery",
-        help="Saved as `device.battery.chargeLevel` in the active vtypes.json.",
-    )
+    if st.session_state.autoware_battery_failure_threshold > battery_capacity:
+        st.session_state.autoware_battery_failure_threshold = battery_capacity
+
+    battery_cols = st.columns(2)
+    with battery_cols[0]:
+        battery_charge_level = st.slider(
+            "Current battery charge [Wh]",
+            min_value=0.0,
+            max_value=float(battery_capacity),
+            step=max(1.0, float(battery_capacity) / 100.0),
+            key="autoware_ego_initial_battery",
+            help="Saved as `device.battery.chargeLevel` in the active vtypes.json.",
+        )
+    with battery_cols[1]:
+        battery_failure_threshold = st.number_input(
+            "Critical battery threshold [Wh]",
+            min_value=0.0,
+            max_value=float(battery_capacity),
+            value=float(st.session_state.autoware_battery_failure_threshold),
+            step=max(1.0, float(battery_capacity) / 100.0),
+            key="autoware_battery_failure_threshold",
+            help=(
+                "If the Autoware ego battery drops below this threshold, the dashboard "
+                "requests a stop and cancels the active route."
+            ),
+        )
+
+    battery_threshold_valid = battery_charge_level > battery_failure_threshold
+    if not battery_threshold_valid:
+        st.warning(
+            "The current battery must be greater than the critical threshold "
+            "to avoid an immediate stop."
+        )
 
     if st.session_state.autoware_ego_last_emission_model != emission_model:
         reset_vtype_model_state("autoware_ego", emission_model)
         st.session_state.autoware_ego_last_emission_model = emission_model
 
-    # Temporarily disabled: overriding the Autoware spawn point from a SUMO edge
-    # was causing unreliable launches. The Docker launch now uses Autoware defaults.
-    st.caption("Custom Autoware spawn-point override is temporarily disabled.")
+    # Autoware Mini is a ROS 1 stack. Start and goal edges are converted into a
+    # ROS initial pose and a ROS navigation goal after the docker launch starts.
+    st.write("### Autoware Route")
+    st.caption(
+        "Select the route exactly like in the scenario step: click the map, choose the edge direction, "
+        "or reuse the current congestion/source/destination edges with the quick actions below."
+    )
+    all_x = [point[0] for edge in autoware_edges for point in edge.shape]
+    all_y = [point[1] for edge in autoware_edges for point in edge.shape]
+    center_x = (min(all_x) + max(all_x)) / 2
+    center_y = (min(all_y) + max(all_y)) / 2
+
+    route_map = folium.Map(
+        location=[center_y, center_x],
+        zoom_start=1,
+        crs="Simple",
+        tiles=None,
+    )
+    for edge in autoware_edges:
+        color = "#2563eb"
+        weight = 4
+        if edge.edge_id == traffic_target_edge:
+            color = "#f97316"
+            weight = 7
+        if edge.edge_id == st.session_state.autoware_start_edge:
+            color = "#16a34a"
+            weight = 8
+        elif edge.edge_id == st.session_state.autoware_goal_edge:
+            color = "#dc2626"
+            weight = 8
+
+        coords = [to_map_coords(point[0], point[1]) for point in edge.shape]
+        folium.PolyLine(
+            coords,
+            color=color,
+            weight=weight,
+            tooltip=edge.edge_id,
+        ).add_to(route_map)
+
+    if st.session_state.autoware_last_click:
+        click_x, click_y = st.session_state.autoware_last_click
+        folium.CircleMarker([click_y, click_x], radius=5, color="black", fill=True).add_to(route_map)
+
+    route_map_data = st_folium(
+        route_map,
+        use_container_width=True,
+        height=420,
+        key=f"autoware_route_map_{selected_map_name}",
+    )
+
+    if route_map_data and route_map_data.get("last_clicked"):
+        click_y = route_map_data["last_clicked"]["lat"]
+        click_x = route_map_data["last_clicked"]["lng"]
+        st.session_state.autoware_last_click = (click_x, click_y)
+
+    if st.session_state.autoware_last_click:
+        click_x, click_y = st.session_state.autoware_last_click
+        candidate, distance = nearest_edge(autoware_edges, click_x, click_y)
+        direction_options = edge_direction_options(autoware_edges, candidate.edge_id)
+        if st.session_state.autoware_clicked_direction not in direction_options:
+            st.session_state.autoware_clicked_direction = candidate.edge_id
+
+        st.write(
+            f"Nearest edge to click: `{candidate.edge_id}` "
+            f"({distance:.1f} m)"
+        )
+        clicked_edge = st.selectbox(
+            "Clicked edge direction",
+            options=direction_options,
+            format_func=lambda value: autoware_labels[value],
+            key="autoware_clicked_direction",
+        )
+
+        click_cols = st.columns(4)
+        with click_cols[0]:
+            if st.button("Use as START", key="autoware_set_start_edge"):
+                st.session_state.autoware_start_edge = clicked_edge
+                st.rerun()
+        with click_cols[1]:
+            if st.button("Use as END", key="autoware_set_goal_edge"):
+                st.session_state.autoware_goal_edge = clicked_edge
+                st.rerun()
+        with click_cols[2]:
+            st.write("")
+        with click_cols[3]:
+            st.write("")
+    else:
+        st.info("Click on the map to select an Autoware edge.")
+
+    edge_cols = st.columns(2)
+    with edge_cols[0]:
+        selected_start_edge = st.selectbox(
+            "Autoware start edge",
+            options=autoware_edge_options,
+            index=edge_select_index(
+                autoware_edge_options,
+                st.session_state.autoware_start_edge or "",
+            ),
+            format_func=lambda value: "Select a start edge" if not value else autoware_labels[value],
+        )
+    with edge_cols[1]:
+        selected_goal_edge = st.selectbox(
+            "Autoware goal edge",
+            options=autoware_edge_options,
+            index=edge_select_index(
+                autoware_edge_options,
+                st.session_state.autoware_goal_edge or "",
+            ),
+            format_func=lambda value: "Select a goal edge" if not value else autoware_labels[value],
+        )
+
+    st.session_state.autoware_start_edge = selected_start_edge or None
+    st.session_state.autoware_goal_edge = selected_goal_edge or None
+
+    if st.session_state.autoware_start_edge and st.session_state.autoware_goal_edge:
+        st.caption(
+            "Autoware edge route: "
+            f"`{st.session_state.autoware_start_edge}` -> `{st.session_state.autoware_goal_edge}`"
+        )
+    else:
+        st.caption(
+            "If start and goal edges are left empty, Autoware still launches but the route must be set manually in RViz."
+        )
+
+    if traffic_target_edge:
+        st.caption(f"Current congestion edge: `{traffic_target_edge}`")
+
+    route_action_cols = st.columns(6)
+    start_opposite = (
+        opposite_edge_id(st.session_state.autoware_start_edge, set(autoware_edge_ids))
+        if st.session_state.autoware_start_edge else None
+    )
+    goal_opposite = (
+        opposite_edge_id(st.session_state.autoware_goal_edge, set(autoware_edge_ids))
+        if st.session_state.autoware_goal_edge else None
+    )
+    with route_action_cols[0]:
+        if st.button(
+            "Use congestion START",
+            key="autoware_quick_congestion_start",
+            disabled=not traffic_target_edge,
+        ):
+            st.session_state.autoware_start_edge = traffic_target_edge
+            st.rerun()
+    with route_action_cols[1]:
+        if st.button(
+            "Use congestion END",
+            key="autoware_quick_congestion_end",
+            disabled=not traffic_target_edge,
+        ):
+            st.session_state.autoware_goal_edge = traffic_target_edge
+            st.rerun()
+    with route_action_cols[2]:
+        if st.button(
+            "Use scenario START",
+            key="autoware_use_scenario_start",
+            disabled=st.session_state.start_edge not in autoware_edge_ids,
+        ):
+            st.session_state.autoware_start_edge = st.session_state.start_edge
+            st.rerun()
+    with route_action_cols[3]:
+        if st.button(
+            "Use scenario END",
+            key="autoware_use_scenario_end",
+            disabled=st.session_state.end_edge not in autoware_edge_ids,
+        ):
+            st.session_state.autoware_goal_edge = st.session_state.end_edge
+            st.rerun()
+    with route_action_cols[4]:
+        if st.button("Invert START", key="autoware_invert_start", disabled=not start_opposite):
+            st.session_state.autoware_start_edge = start_opposite
+            st.rerun()
+    with route_action_cols[5]:
+        if st.button("Invert END", key="autoware_invert_end", disabled=not goal_opposite):
+            st.session_state.autoware_goal_edge = goal_opposite
+            st.rerun()
+
+    st.number_input(
+        "Autoware planner speed cap [km/h]",
+        min_value=5.0,
+        max_value=130.0,
+        value=50.0,
+        step=1.0,
+        key="autoware_planner_speed_limit_kmh",
+        help=(
+            "Autoware Mini uses map speed limits only if the Lanelet2 map contains them. "
+            "These Town01/Town04/Town05 maps currently do not, so this value acts as the effective route speed cap."
+        ),
+    )
+    st.caption(
+        "The current Lanelet2 Town maps do not expose per-lane `speed_limit` or `speed_ref` tags, "
+        "so the planner falls back to the configured global cap loaded at Autoware startup."
+    )
 
     attribute_defaults, parameter_defaults = ego_model_defaults(emission_model)
 
@@ -1404,9 +1984,15 @@ def render_autoware_ego_vtype_editor():
             "SUMO/CARLA is already armed from step 3 and waiting for Autoware. "
             "Click `Run Autoware` to start the warm-up and then release the simulation."
         )
-    st.caption(
-        f"The configured Autoware startup wait is `{autoware_delay}s` and starts when you click `Run Autoware`."
-    )
+    if sumo_gui_enabled:
+        st.caption(
+            "SUMO GUI is enabled, so the Autoware startup wait is disabled and the simulation "
+            "is released immediately when you click `Run Autoware`."
+        )
+    else:
+        st.caption(
+            f"The configured Autoware startup wait is `{autoware_delay}s` and starts when you click `Run Autoware`."
+        )
 
     action_cols = st.columns(2)
     with action_cols[0]:
@@ -1414,31 +2000,63 @@ def render_autoware_ego_vtype_editor():
     with action_cols[1]:
         launch_clicked = st.button(
             "Run Autoware",
-            disabled=sync_running and not sync_waiting_for_autoware,
+            disabled=(sync_running and not sync_waiting_for_autoware) or not battery_threshold_valid,
         )
 
     if save_clicked or launch_clicked:
+        autoware_vtype_params = dict(parameters)
+        autoware_vtype_params["dashboard.battery.failureThreshold"] = str(
+            float(battery_failure_threshold)
+        )
         write_autoware_ego_vtype_config(
             emission_model,
             battery_capacity,
             battery_charge_level,
             attributes=attributes,
-            parameters=parameters,
+            parameters=autoware_vtype_params,
         )
         if save_clicked:
             st.success(f"`{AUTOWARE_EGO_VTYPE}` updated in vtypes.json.")
 
     if launch_clicked:
+        selected_start_edge = st.session_state.autoware_start_edge
+        selected_goal_edge = st.session_state.autoware_goal_edge
+        if bool(selected_start_edge) != bool(selected_goal_edge):
+            st.error("Select both the Autoware start edge and the Autoware goal edge.")
+            return {
+                "sumo_vtype": AUTOWARE_EGO_VTYPE,
+                "carla_blueprint": AUTOWARE_EGO_VTYPE,
+                "emission_model": emission_model,
+                "battery_capacity": battery_capacity,
+                "battery_charge_level": battery_charge_level,
+                "attributes": attributes,
+                "parameters": parameters,
+                "emission_class": ego_emission_class_value(emission_model),
+            }
         try:
             started_at = time.time()
-            launch = launch_autoware_carla_in_container(selected_map_name)
+            launch = launch_autoware_carla_in_container(
+                selected_map_name,
+                start_edge=selected_start_edge,
+                goal_edge=selected_goal_edge,
+                speed_limit_kmh=float(st.session_state.autoware_planner_speed_limit_kmh),
+            )
             st.session_state.autoware_last_launch = {
                 "map_name": selected_map_name,
                 "container_name": launch.get("container_name"),
                 "command": launch.get("command"),
                 "started_at": started_at,
                 "startup_wait_seconds": autoware_delay,
+                "start_edge": selected_start_edge,
+                "goal_edge": selected_goal_edge,
+                "speed_limit_kmh": float(st.session_state.autoware_planner_speed_limit_kmh),
+                "battery_failure_threshold": float(battery_failure_threshold),
+                "planner_speed_limit_setup": launch.get("planner_speed_limit_setup"),
+                "route_publication_error": launch.get("route_publication_error"),
             }
+            st.session_state.autoware_active_battery_failure_threshold = float(
+                battery_failure_threshold
+            )
         except Exception as exc:
             st.error(f"Autoware start failed: {exc}")
             return {
@@ -1458,11 +2076,55 @@ def render_autoware_ego_vtype_editor():
         )
         st.caption(f"Host prep: `{launch['host_command']}` with `DISPLAY={launch['display']}`")
         st.caption(f"Executed: `{launch['command']}`")
+        if selected_start_edge and selected_goal_edge:
+            st.caption(
+                f"ROS route: `{selected_start_edge}` -> `{selected_goal_edge}`"
+            )
+        initial_pose_data = launch.get("initial_pose") or {}
+        goal_pose_data = launch.get("goal_pose") or {}
+        if initial_pose_data and goal_pose_data:
+            st.caption(
+                "Resolved ROS poses with "
+                f"`{initial_pose_data.get('projection_mode')}` projection."
+            )
+        st.caption(
+            f"Planner speed cap: `{float(st.session_state.autoware_planner_speed_limit_kmh):.0f} km/h`."
+        )
+        st.caption(
+            f"Critical battery threshold: `{float(battery_failure_threshold):.1f} Wh`."
+        )
+        planner_speed_limit_setup = launch.get("planner_speed_limit_setup") or {}
+        if planner_speed_limit_setup.get("planning_yaml"):
+            st.caption(
+                "Planner config written to "
+                f"`{planner_speed_limit_setup['planning_yaml']}` before `roslaunch`."
+            )
+        if launch.get("route_publication_error"):
+            st.error(
+                "Autoware launched, but publishing `/initialpose` and "
+                f"`/move_base_simple/goal` failed: {launch['route_publication_error']}"
+            )
+            return {
+                "sumo_vtype": AUTOWARE_EGO_VTYPE,
+                "carla_blueprint": AUTOWARE_EGO_VTYPE,
+                "emission_model": emission_model,
+                "battery_capacity": battery_capacity,
+                "battery_charge_level": battery_charge_level,
+                "attributes": attributes,
+                "parameters": parameters,
+                "emission_class": ego_emission_class_value(emission_model),
+            }
         if sync_waiting_for_autoware:
             try:
-                with st.spinner(
-                    f"Waiting {autoware_delay}s for Autoware startup, then releasing the SUMO/CARLA simulation..."
-                ):
+                spinner_message = (
+                    "Releasing the SUMO/CARLA simulation immediately after the Autoware launch..."
+                    if autoware_delay == 0
+                    else (
+                        f"Waiting {autoware_delay}s for Autoware startup, then releasing the "
+                        "SUMO/CARLA simulation..."
+                    )
+                )
+                with st.spinner(spinner_message):
                     time.sleep(max(0, autoware_delay))
                     if not waiting_for_autoware_sync():
                         raise RuntimeError(
@@ -1474,9 +2136,14 @@ def render_autoware_ego_vtype_editor():
             except Exception as exc:
                 st.error(f"Autoware started, but the SUMO release failed: {exc}")
         else:
-            st.caption(
-                f"Warm-up timer started now. Step 3 can start the simulation after `{autoware_delay}s`."
-            )
+            if autoware_delay == 0:
+                st.caption(
+                    "Warm-up wait is disabled. Step 3 can start the simulation immediately."
+                )
+            else:
+                st.caption(
+                    f"Warm-up timer started now. Step 3 can start the simulation after `{autoware_delay}s`."
+                )
 
     return {
         "sumo_vtype": AUTOWARE_EGO_VTYPE,
@@ -2050,7 +2717,11 @@ def render_simulation_runner(result=None):
             max_value=120,
             step=1,
             key="autoware_sync_delay_selection",
-            help="Delay applied in step 4 before the co-simulation process is started.",
+            disabled=bool(sumo_gui),
+            help=(
+                "Delay applied in step 4 before the co-simulation process is started. "
+                "Disabled when SUMO GUI is enabled."
+            ),
         )
     st.session_state.traffic_carla_mode = "reuse"
     st.session_state.traffic_sumo_gui = bool(st.session_state.traffic_sumo_gui_selection)
@@ -2058,6 +2729,8 @@ def render_simulation_runner(result=None):
         st.session_state.autoware_sync_delay_seconds = int(
             st.session_state.autoware_sync_delay_selection
         )
+        if sumo_gui:
+            st.caption("Autoware startup wait is disabled while SUMO GUI is enabled.")
 
     if carla_server_ready:
         st.caption(

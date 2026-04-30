@@ -2,8 +2,8 @@ import traci
 import subprocess
 import time
 
-from config import SUMO_BINARY, SUMO_CONFIG
-from ego_controller import stop_if_needed
+from aev_drivelab.simulation.config import SUMO_BINARY, SUMO_CONFIG
+from aev_drivelab.simulation.ego_controller import stop_if_needed
 
 class SimulationManager:
     def __init__(self):
